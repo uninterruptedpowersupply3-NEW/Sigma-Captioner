@@ -11,6 +11,8 @@ Else compute would be wasted. (CAN BE CHANGED MANUALLY)
 
 <img width="1786" height="1345" alt="image" src="https://github.com/user-attachments/assets/2971e951-c218-4a33-a840-93abddc81024" />
 
+The download button will download all selected models and the start button will perform infrence on all selected models
+
 
 Model Name	Status	
 laion/CLIP-ViT-H-14-laion2B-s32B-b79K            	In Development	
