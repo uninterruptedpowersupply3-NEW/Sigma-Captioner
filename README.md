@@ -37,7 +37,7 @@ uv pip install req.txt
 
 python main.py
 
-optionally download for better performance
+optionally download for better performance while using florence
 
 flash_attn-2.7.4.post1%2Bcu128torch2.7.0cxx11abiFALSE-cp310-cp310-win_amd64.whl
 
