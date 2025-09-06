@@ -19,7 +19,7 @@ The download button will download all selected models and the start button will 
 
 To set this up follow these steps
 
-#END OF ONLY DO THIS FOR THE FIRST TIME
+#ONLY DO THIS FOR THE FIRST TIME
 
 python -m venv venv
 
