@@ -14,17 +14,8 @@ Else compute would be wasted. (CAN BE CHANGED MANUALLY)
 The download button will download all selected models and the start button will perform infrence on all selected models
 
 
-Model Name	Status	
-laion/CLIP-ViT-H-14-laion2B-s32B-b79K            	In Development	
-laion/CLIP-ViT-L-14-laion2B-s32B-b82K	            In Development	
-Salesforce/blip-vqa-base	                        Work	
-Salesforce/blip-image-captioning-large	          Work	
-microsoft/Florence-2-large-ft                    	Work	
-microsoft/git-large-textvqa	                      Work	
-HuggingFaceTB/SmolVLM-256M-Instruct              	Work	
-vikhyatk/moondream2	                              In Development	
-milingWolf/wd-eva02-large-tagger-v3              	Work	
-fancyfeast/llama-joycaption-beta-one-hf-llava	    In Development	
+<img width="833" height="340" alt="image" src="https://github.com/user-attachments/assets/a607a312-5f95-480d-9eeb-4f94838f3b80" />
+
 
 To set this up follow these steps
 
