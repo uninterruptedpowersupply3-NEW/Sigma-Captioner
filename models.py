@@ -16,6 +16,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Any
 
+
 try:
     from llama_cpp import Llama
     import tempfile
@@ -60,6 +61,7 @@ class BaseModelWrapper:
 
     def _load_model_specific(self): raise NotImplementedError
     def _infer_model_specific(self, images, **kwargs): raise NotImplementedError
+
 
 # --- FINAL BlipModel CLASS ---
 class BlipModel(BaseModelWrapper):
