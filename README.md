@@ -29,9 +29,7 @@ pip install uv
 
 uv pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 
-uv pip install xformers==0.0.31.post1
-
-uv pip install req.txt
+uv pip install transformers==4.49.0 transformers huggingface-hub safetensors pandas timm clip_interrogator llama-cpp-python PyQt6 bitsandbytes numpy datasets numba xformers==0.0.31.post1 einops
 
 #END OF ONLY DO THIS FOR THE FIRST TIME
 
