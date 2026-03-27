@@ -17,6 +17,28 @@ This application is designed to generate image-text pairs to make sorting images
 
 -----
 
+## Inspired by CLIP-Interrogator
+
+The Qwen3-VL-Embedding system is heavily inspired by the classic CLIP-Interrogator workflow. It extracts high-dimensional visual features from your images and mathematically compares them against a precalculated Vocabulary Matrix—a massive cache of text-based embeddings—by performing similarity matching via a dot product on normalized vectors, which mathematically behaves perfectly like Cosine Similarity.
+
+This implementation is engineered for extreme speed, easily achieving 100+ captions per second on an RTX 3070 Ti. To feed the GPU this fast, the pipeline utilizes highly optimized Windows GPU-based image processing. It performs Dynamic Resolution Bucketing—rapidly scanning image headers to extract dimensions without fully decoding the files. This allows the system to instantly group batches by uniform resolutions and snap them precisely to a 28-pixel grid, maximizing the Qwen vision encoder's throughput.
+
+📦 Out-of-the-Box Setup for Qwen
+For the Qwen embedding system to work immediately out of the box, you will need a precalculated vocabulary matrix.
+👉 Download the Official Precalculated Matrices (Hugging Face)
+https://huggingface.co/UPShf/Vocabulary-Qwen3-VL-Embedding-2B
+
+Making your own: If you prefer to use your own custom tags or dictionary, you can generate a matrix manually using the built-in Preprocessing Workstation tab. Thanks to the optimized batching engine, compiling a massive custom dictionary from raw text takes less than 20 minutes on standard hardware.
+
+🙏 Acknowledgements & Datasets
+The official precalculated vocabulary matrices were generated using the following incredible open-source datasets. Huge thanks to their creators:
+
+English [dwyl/english-words](https://github.com/dwyl/english-words)
+
+Anime/Visual [cagliostrolab/860k-ordered-tags-json](https://huggingface.co/datasets/cagliostrolab/860k-ordered-tags-json) (Danbooru tags)
+
+-----
+
 ## 🛠️ Installation & Setup (Windows)
 
 We have provided automated scripts to make setup painless.
