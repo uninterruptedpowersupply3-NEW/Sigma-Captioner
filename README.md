@@ -31,6 +31,9 @@ uv pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url ht
 
 uv pip install transformers==4.49.0 transformers huggingface-hub safetensors pandas timm clip_interrogator llama-cpp-python PyQt6 bitsandbytes numpy datasets numba xformers==0.0.31.post1 einops sageattention
 
+# For Qwen Support
+uv pip install qwen-vl-utils
+
 #END OF ONLY DO THIS FOR THE FIRST TIME
 
 python main.py
@@ -56,3 +59,10 @@ HuggingFaceTB/SmolVLM-256M-Instruct              	Work
 vikhyatk/moondream2	                              In Development	
 milingWolf/wd-eva02-large-tagger-v3              	Work	
 fancyfeast/llama-joycaption-beta-one-hf-llava	    In Development	
+Qwen/Qwen3-VL-Embedding-2B                        Work
+LM-Sys/SGLang (Local Endpoint)                    Work
+
+## Fast Inference Workstations
+Sigma-Captioner natively supports independent backend workstations for **Qwen3-VL** and **SGLang**. You can launch their standalone Tkinter UIs directly from the new Workstation tabs located in the Sigma-Captioner GUI. 
+
+For integration with older dataset structures, both of these models support a **Legacy Support** toggle in the settings. Enabling this rewrites their JSON properties to perfectly mimic the structures of `wd_tagger` and `smolvlm` outputs respectively, ensuring zero downtime with your existing sorting tools.

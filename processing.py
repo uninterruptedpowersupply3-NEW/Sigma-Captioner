@@ -2,331 +2,560 @@ import os
 import json
 import time
 import traceback
-from PIL import Image
-# --- ADD THIS IMPORT ---
-from PyQt6.QtCore import QThread, pyqtSignal
-from torch.utils.data import Dataset, DataLoader
-# --- END OF ADDITION ---
 import torch
 import gc
+import sys
+import requests
+import asyncio
+import aiohttp
+import base64
+import io
+import re
+import concurrent.futures
+from PIL import Image
+from PyQt6.QtCore import QObject, pyqtSignal, QThread
 from collections import defaultdict
-
-# ... (imports for models are fine)
-from models import (
-    BlipModel, FlorenceModel, ClipInterrogatorModel,
-    JoyCaptionModel, GitModel
-)
-from wd_tagger_app2 import WDTaggerApp2Model
-from moondream_model import MoondreamModel
-from smolvlm_model import SmolVLMModel
 from utils import get_model_path
 
-Image.MAX_IMAGE_PIXELS = None
+# Add qwen_embedding to path
+qwen_path = os.path.join(os.path.dirname(__file__), 'qwen_embedding')
+if qwen_path not in sys.path:
+    sys.path.append(qwen_path)
 
-# --- START OF MODIFICATION 1: ADD DATASET AND COLLATE FUNCTION ---
+class BaseModelWrapper:
+    def __init__(self, model_key, model_path, config):
+        self.model_key = model_key
+        self.model_path = model_path
+        self.config = config
+        self.log_callback = print
 
-class ImageCaptioningDataset(Dataset):
-    """
-    A PyTorch Dataset to handle loading images from a list of paths.
-    This is what the DataLoader's worker processes will use.
-    """
-    def __init__(self, image_paths):
-        self.image_paths = image_paths
+    def set_log_callback(self, cb):
+        self.log_callback = cb
 
-    def __len__(self):
-        return len(self.image_paths)
+    def _log(self, msg):
+        self.log_callback(msg)
 
-    def __getitem__(self, idx):
-        path = self.image_paths[idx]
+    def load(self):
+        self._load_model_specific()
+
+    def unload(self):
+        self._unload_model_specific()
+
+    def _load_model_specific(self):
+        pass
+
+    def _unload_model_specific(self):
+        pass
+
+    def infer(self, images, **kwargs):
+        return self._infer_model_specific(images, **kwargs)
+
+    def _infer_model_specific(self, images, **kwargs):
+        return [{"caption": "Base model output"}] * len(images)
+
+class QwenModel(BaseModelWrapper):
+    def _load_model_specific(self):
+        from backend import FastQwenEngine
+        self.engine = FastQwenEngine(
+            model_id=self.model_path,
+            precision=self.config.get("qwen_precision", "bf16"),
+            tf32=self.config.get("qwen_tf32", True),
+            quant=self.config.get("qwen_quant", False),
+            output_dim=self.config.get("qwen_output_dim", 2048),
+            inductor_cache_dir=self.config.get("qwen_inductor_cache_dir", ""),
+            inductor_compile_threads=self.config.get("qwen_inductor_compile_threads", 0),
+            log_callback=self.log_callback
+        )
+        cache_path = self.config.get("qwen_json_cache_path", "")
+        if cache_path and os.path.exists(cache_path):
+            self._log(f"Loading Qwen vocab cache: {cache_path}")
+            self.engine.load_vocab_cache(cache_path)
+        else:
+            self._log("Notice: No Qwen vocab cache found. Using default tags.")
+            self.engine.prepare_vocabulary(["masterpiece", "best quality", "1girl", "1boy", "anime"])
+        
+    def _infer_model_specific(self, images, **kwargs):
+        results = self.engine.predict_batch(
+            images,
+            threshold=self.config.get("qwen_threshold", 0.3),
+            max_tags=self.config.get("qwen_max_tags", 50),
+            use_compile=self.config.get("qwen_compile", True),
+            dynamic_compile=self.config.get("qwen_dynamic", True),
+            use_cuda_graphs=self.config.get("qwen_cuda_graphs", False),
+            use_pinned_memory=self.config.get("qwen_pinned_mem", True)
+        )
+        return [{"caption": ", ".join([t for t, s in res])} for res in results]
+
+    def _unload_model_specific(self):
+        if hasattr(self, 'engine'):
+            del self.engine
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+class SGLangModel(BaseModelWrapper):
+    def __init__(self, model_key, model_path, config):
+        super().__init__(model_key, model_path, config)
+        # Priority: sglang_url -> sglang_endpoint -> default
+        self.url = self.config.get("sglang_url") or self.config.get("sglang_endpoint") or "http://127.0.0.1:30000/generate"
+        if "/v1" in self.url and "/generate" not in self.url:
+            # If user provided as V1 endpoint, we might need to adjust for internal lookups if code expects /generate
+            # But the Client handles both. SGLangModel logic might need a base.
+            pass
+        self.concurrency = self.config.get("sglang_concurrency", 40)
+        self.max_tokens = self.config.get("sglang_max_tokens", 1024)
+        self.max_res = self.config.get("sglang_max_res", 256)
+        self.system_context = self.config.get("sglang_system_context", "")
+
+    def load(self):
+        self._log(f"SGLang Client Ready: {self.url}")
+        
+        # Auto-Start via WSL
+        if self.config.get("sglang_auto_wsl", False):
+            # First check if server is already responding
+            try:
+                # Use /v1/models or similar as a light health check
+                test_url = self.url.replace('/generate', '/v1/models').replace('/v1/chat/completions', '/v1/models')
+                resp = requests.get(test_url, timeout=2)
+                if resp.status_code == 200:
+                    self._log("[SGLang] Server already responding. Skipping launch.")
+                    return
+            except:
+                pass
+
+            wsl_cmd = self.config.get("sglang_wsl_cmd", "").strip()
+            if wsl_cmd:
+                self._log(f"[SGLang] Starting WSL server: {wsl_cmd}")
+                import subprocess
+                
+                # Robust command handling: if it already starts with wsl, run it directly
+                if wsl_cmd.lower().startswith("wsl"):
+                    if os.name == 'nt':
+                        cmd = wsl_cmd # Run as string
+                    else:
+                        cmd = ["bash", "-c", wsl_cmd]
+                else:
+                    cmd = ["wsl", "bash", "-c", wsl_cmd]
+
+                try:
+                    subprocess.Popen(
+                        cmd, 
+                        shell=isinstance(cmd, str), 
+                        creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0
+                    )
+                    
+                    # Health check loop
+                    self._log("[SGLang] Waiting for server to become responsive...")
+                    start_time = time.time()
+                    connected = False
+                    # Health check URL (remove trailing /generate or /v1 bits)
+                    health_url = self.url.replace('/generate', '').split('/v1')[0]
+                    
+                    while time.time() - start_time < 120: # 2 min timeout
+                        try:
+                            # Try the root or a known info endpoint
+                            # SGLang uses /v1/models or just /
+                            requests.get(health_url, timeout=1)
+                            connected = True
+                            break
+                        except:
+                            time.sleep(3)
+                    
+                    if connected:
+                        self._log("[SGLang] Server is up and responding!")
+                    else:
+                        self._log("[SGLang] WARNING: Server failed to respond within 120s. Pipeline may fail.")
+                except Exception as e:
+                    self._log(f"[SGLang] Failed to launch WSL server: {e}")
+
+    def unload(self):
+        should_shutdown = self.config.get("sglang_shutdown_wsl_on_unload", True)
+        if should_shutdown:
+            self._log("Initiating total shutdown of WSL Host to reclaim System RAM...")
+            try:
+                import subprocess
+                subprocess.run(["wsl", "--shutdown"], check=False)
+                self._log("[SGLang] Unload: WSL Shutdown signal sent.")
+            except Exception as e:
+                self._log(f"WSL shutdown hook failed: {e}")
+            
+            # Mandatory "settling" delay for hardware reclamation
+            self._log("Waiting 10 seconds for WSL buffers to clear and VRAM to stabilize...")
+            time.sleep(10)
+        
+    def _infer_model_specific(self, images, **kwargs):
         try:
-            # Open the image using PIL
-            with Image.open(path) as img:
-                # We return a copy of the image object and its original path
-                return img.copy(), path
-        except Exception:
-            # If an image is corrupt or cannot be opened, return None.
-            # Our collate_fn will handle filtering these out.
-            return None, None
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        async def run_burst():
+            sem = asyncio.Semaphore(self.concurrency)
+            async with aiohttp.ClientSession() as session:
+                tasks = [self._async_infer(session, sem, img) for img in images]
+                return await asyncio.gather(*tasks)
+        
+        return loop.run_until_complete(run_burst())
 
-def collate_fn(batch):
-    """
-    A custom collate function to filter out failed image loads (None values)
-    before they are passed to the model.
-    """
-    # Filter out samples where the image failed to load
-    batch = [b for b in batch if b[0] is not None]
-    if not batch:
-        # If the whole batch failed, return empty lists
-        return [], []
-    
-    # "Unzip" the batch of (image, path) tuples into two separate lists
-    images, paths = zip(*batch)
-    return list(images), list(paths)
+    async def _async_infer(self, session, sem, img):
+        async with sem:
+            try:
+                # Resize if needed
+                orig_w, orig_h = img.size
+                if img.width > self.max_res or img.height > self.max_res:
+                    img = img.copy()
+                    img.thumbnail((self.max_res, self.max_res), Image.Resampling.LANCZOS)
+                
+                new_w, new_h = img.size
+                if new_w != orig_w or new_h != orig_h:
+                    self._log(f"[SGLang] Resizing image for context safety: {orig_w}x{orig_h} -> {new_w}x{new_h}")
+                # Quiet mode: no log if it fits perfectly
 
-# --- END OF MODIFICATION 1 ---
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="JPEG", quality=85)
+                b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
 
+                # Context Correction: 
+                # If the user has a 1024 context, and max_tokens is 1024, it will CRASH.
+                # Qwen2-VL 256x256 is roughly 334 tokens. 
+                # We cap max_new_tokens to (context - 450) to ensure safe intake.
+                # Assuming context is 1024 (user setting).
+                safe_max_tokens = min(self.max_tokens, 1024 - 450) if self.max_tokens >= 512 else self.max_tokens
+                if safe_max_tokens != self.max_tokens:
+                    self._log(f"[SGLang] Safety Cap: Reduced max_new_tokens from {self.max_tokens} to {safe_max_tokens} to fit 1024 context.")
+
+                if "/generate" in self.url:
+                    # Enforce the <reasoning> <answer> format via SGLang regex
+                    format_regex = r"<reasoning> [\s\S]*? </reasoning> <answer> [\s\S]*? </answer>"
+                    
+                    payload = {
+                        "text": f"<|im_start|>system\n{self.system_context}<|im_end|>\n<|im_start|>user\n<image>\nPlease analyze.<|im_end|>\n<|im_start|>assistant\n",
+                        "image_data": b64_img,
+                        "sampling_params": {
+                            "temperature": 0.7, 
+                            "max_new_tokens": safe_max_tokens,
+                            "regex": format_regex
+                        }
+                    }
+                else:
+                    payload = {
+                        "model": "default",
+                        "messages": [
+                            {"role": "system", "content": self.system_context},
+                            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}, {"type": "text", "text": "Analyze image"}]}
+                        ],
+                        "max_tokens": safe_max_tokens
+                    }
+                    if self.config.get("sglang_disable_reasoning", True):
+                        payload["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+
+                async with session.post(self.url, json=payload, timeout=120) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text = (data.get("text") or data.get("choices", [{}])[0].get("message", {}).get("content", ""))
+                        if not text and "choices" in data:
+                             text = data["choices"][0].get("text", "")
+                        return self._parse_output(text)
+                    
+                    err_text = await resp.text()
+                    return {"error": f"HTTP {resp.status}: {err_text[:200]}"}
+            except Exception as e:
+                return {"error": str(e)}
+
+    def _parse_output(self, text):
+        # Explicit Tag Extraction for <reasoning> and <answer>
+        reasoning = ""
+        answer = ""
+        
+        r_match = re.search(r"<reasoning>([\s\S]*?)</reasoning>", text)
+        if r_match:
+            reasoning = r_match.group(1).strip()
+        
+        a_match = re.search(r"<answer>([\s\S]*?)</answer>", text)
+        if a_match:
+            answer_content = a_match.group(1).strip()
+            # Advanced JSON extraction if the model nested it inadvertently
+            if "{" in answer_content and "}" in answer_content:
+                try:
+                    json_match = re.search(r"(\{[\s\S]*\})", answer_content)
+                    if json_match:
+                        ans_json = json.loads(json_match.group(1))
+                        if not reasoning and "thought_process" in ans_json:
+                            reasoning = ans_json["thought_process"]
+                        if "answer" in ans_json:
+                            answer = str(ans_json["answer"])
+                        elif "caption" in ans_json:
+                            answer = str(ans_json["caption"])
+                        else:
+                            answer = answer_content
+                    else:
+                        answer = answer_content
+                except:
+                    answer = answer_content
+            else:
+                answer = answer_content
+
+        # Fallback for models without tags (e.g. if regex forcing was disabled)
+        if not reasoning and not answer:
+            if "<think>" in text:
+                match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+                if match:
+                    reasoning = match.group(1).strip()
+                    text = text.replace(match.group(0), "").strip()
+            elif "Thought:" in text:
+                t_match = re.search(r"Thought:(.*?)(?:\n\n|$)", text, re.DOTALL)
+                if t_match:
+                    reasoning = t_match.group(1).strip()
+                    text = text.replace(t_match.group(0), "").strip()
+            answer = text
+        
+        formatted_answer = f"<reasoning> {reasoning} </reasoning> <answer> {answer} </answer>"
+        
+        is_legacy = self.config.get("sglang_legacy_support", False)
+        if is_legacy:
+            return {"qa_pairs": [{"question": "Describe this image.", "answer": formatted_answer}]}
+        
+        return {"reasoning": reasoning, "answer": answer, "full_output": formatted_answer}
 
 class ProcessingWorker(QThread):
-    progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(str)
+    progress = pyqtSignal(int, int, str)
     log = pyqtSignal(str)
-    
+
     def __init__(self, config):
         super().__init__()
-        # ... (the rest of __init__ is unchanged)
         self.config = config
         self._is_running = True
+        self.write_buffer = {}  # Buffering writes to save NVME endurance
+        self.flush_interval = 500 # Flush every 500 images
         
+        # Delayed imports to avoid circular/early load issues
+        from models import BlipModel, FlorenceModel, ClipInterrogatorModel, JoyCaptionModel, GitModel
+        from moondream_model import MoondreamModel
+        from smolvlm_model import SmolVLMModel
+        from wd_tagger_app2 import WDTaggerApp2Model
+
         self.model_map = {
-            "CLIP_Interrogator": ClipInterrogatorModel, "BLIP": BlipModel, 
-            "Florence-2": FlorenceModel, "JoyCaption": JoyCaptionModel, 
-            "GIT": GitModel, "WD_Tagger": WDTaggerApp2Model,
-            "Moondream": MoondreamModel, "SmolVLM": SmolVLMModel,
+            "SGLang": SGLangModel, # SGLang first as requested
+            "Qwen": QwenModel,
+            "CLIP_Interrogator": ClipInterrogatorModel, "BLIP": BlipModel,
+            "Florence-2": FlorenceModel, "JoyCaption": JoyCaptionModel, "GIT": GitModel,
+            "WD_Tagger": WDTaggerApp2Model, "Moondream": MoondreamModel,
+            "SmolVLM": SmolVLMModel
         }
         self.json_key_map = {
-            "CLIP_Interrogator": "clip_interrogator", "BLIP": "blip", 
-            "Florence-2": "florence", "JoyCaption": "llava", "GIT": "git", 
-            "WD_Tagger": "wd_tagger", "Moondream": "moondream", 
-            "SmolVLM": "smolvlm",
+            "SGLang": "sglang",
+            "Qwen": "qwen",
+            "CLIP_Interrogator": "clip_interrogator", "BLIP": "blip",
+            "Florence-2": "florence", "JoyCaption": "llava", "GIT": "git",
+            "WD_Tagger": "wd_tagger", "Moondream": "moondream",
+            "SmolVLM": "smolvlm"
         }
-        
-        self.general_questions = []
-        self.moondream_questions = []
-        self.image_question_map = {}
-        self.moondream_image_question_map = {}
 
-    # ... (stop, run, and question loading methods are unchanged) ...
     def stop(self):
         self._is_running = False
-        self.log.emit("Processing stop requested. Finishing current batch...")
 
     def run(self):
-        start_time = time.time()
-        self.log.emit("Discovering images...")
-
-        if self.config.get('use_question_file'):
-            try:
-                with open(self.config['question_json_path'], 'r', encoding='utf-8') as f:
-                    self.general_questions = json.load(f)
-                if not isinstance(self.general_questions, list) or not self.general_questions:
-                    self.log.emit("Warning: General question file is invalid or empty. Using common question.")
-                    self.general_questions = [self.config.get('common_question')]
-                else:
-                    self.log.emit(f"Loaded {len(self.general_questions)} general questions.")
-            except Exception as e:
-                self.log.emit(f"Error loading general question file: {e}. Using common question.")
-                self.general_questions = [self.config.get('common_question')]
-        else:
-            self.general_questions = [self.config.get('common_question')]
-
-        if self.config.get('use_moondream_question_file'):
-            try:
-                with open(self.config['moondream_question_json_path'], 'r', encoding='utf-8') as f:
-                    self.moondream_questions = json.load(f)
-                if not isinstance(self.moondream_questions, list) or not self.moondream_questions:
-                    self.log.emit("Warning: Moondream question file is invalid or empty. Falling back to general questions.")
-                    self.moondream_questions = self.general_questions
-                else:
-                    self.log.emit(f"Loaded {len(self.moondream_questions)} Moondream-specific questions.")
-            except Exception as e:
-                self.log.emit(f"Error loading Moondream question file: {e}. Moondream will use general questions.")
-                self.moondream_questions = self.general_questions
-        else:
-            self.moondream_questions = self.general_questions
-
-        image_paths = self._discover_images()
-        images_to_process = self._filter_images(image_paths)
-        if not images_to_process:
-            self.log.emit("No new images to process."); self.finished.emit("Finished."); return
-
-        for i, path in enumerate(images_to_process):
-            self.image_question_map[path] = self.general_questions[i % len(self.general_questions)]
-            self.moondream_image_question_map[path] = self.moondream_questions[i % len(self.moondream_questions)]
-
-        final_results = self.run_sequential_batched(images_to_process)
-        self.log.emit("--- All models processed. Saving JSON files... ---")
-        for i, path in enumerate(final_results.keys()):
-            if not self._is_running: break
-            self.progress.emit(i + 1, len(final_results), f"Saving {os.path.basename(path)}")
-            question_used = self.moondream_image_question_map.get(path) if 'moondream' in final_results[path] and self.config.get('use_moondream_question_file') else self.image_question_map.get(path)
-            self._save_final_json(path, final_results[path], question_used)
-        
-        duration = time.time() - start_time
-        self.finished.emit(f"Processing finished in {duration:.2f} seconds.")
-
-
-    # --- START OF MODIFICATION 2: REPLACE THE run_sequential_batched METHOD ---
-    def run_sequential_batched(self, images_to_process):
-        self.log.emit("--- Starting sequential batch processing with DataLoader ---")
-        self.models = {}
-        final_results = defaultdict(dict)
-        total_images = len(images_to_process)
-        
-        try:
-            for model_key, model_class in self.model_map.items():
-                json_key = self.json_key_map[model_key]
-                if not self.config['models_enabled'].get(json_key): continue
-                if not self._is_running: break
-                
-                model_path = get_model_path(model_key, self.config)
-                self.log.emit(f"[{model_key}] Loading from {model_path}...")
-                
-                model = model_class(model_key, model_path, self.config)
-                model.set_log_callback(self.log.emit)
-                model.load()
-                self.models[model_key] = model
-                
-                batch_size = self.config['model_specific_batch_sizes'].get(json_key, 1)
-                self.log.emit(f"[{model_key}] Starting processing with batch size {batch_size} and parallel workers...")
-
-                # Create the Dataset and DataLoader
-                dataset = ImageCaptioningDataset(images_to_process)
-                data_loader = DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    prefetch_factor=5,
-                    num_workers=8,  # Use multiple CPU cores to load data in the background
-                    pin_memory=True, # Speeds up CPU to GPU data transfer
-                    collate_fn=collate_fn # Our function to handle corrupt images
-                )
-
-                total_processed_for_model = 0
-                # The new, efficient processing loop
-                for batch_images, batch_paths in data_loader:
-                    if not self._is_running: break
-                    if not batch_images: continue # Skip if the entire batch was corrupt
-
-                    total_processed_for_model += len(batch_paths)
-
-                    # Get the questions for the current valid batch
-                    if model_key == "Moondream":
-                        questions_for_batch = [self.moondream_image_question_map.get(path) for path in batch_paths]
-                    else:
-                        questions_for_batch = [self.image_question_map.get(path) for path in batch_paths]
-                    
-                    try:
-                        self.progress.emit(total_processed_for_model, total_images, f"Processing {len(batch_images)} images with {model_key}...")
-                        batch_outputs = self._run_inference_for_model(model, model_key, json_key, batch_images, questions_for_batch)
-                    except Exception as e:
-                        self.log.emit(f"---!!! FATAL BATCH ERROR with {model_key} !!!---")
-                        self.log.emit(f"ERROR: {e}\n{traceback.format_exc()}")
-                        self.log.emit("---!!! SKIPPING THIS BATCH AND CONTINUING !!!---")
-                        batch_outputs = [{"Error": f"Fatal batch error: {e}"}] * len(batch_images)
-
-                    for idx, output in enumerate(batch_outputs):
-                        # The batch_paths list is now guaranteed to be the correct size
-                        final_results[batch_paths[idx]].update({json_key: output})
-
-                self.models[model_key].unload()
-                del self.models[model_key]
-
-        finally:
-            self._cleanup()
-        return final_results
-    # --- END OF MODIFICATION 2 ---
-
-    # ... (the rest of the file, from _run_inference_for_model onwards, is unchanged) ...
-    def _run_inference_for_model(self, instance, model_key, json_key, batch_images, questions_for_batch):
-        if model_key == "Florence-2":
-            return self._run_florence_tasks(instance, batch_images, questions_for_batch)
-        elif model_key in ["BLIP", "GIT", "JoyCaption", "Moondream", "SmolVLM"]:
-            return instance.infer(batch_images, questions=questions_for_batch)
-        else:
-            return instance.infer(batch_images)
-
-    def _run_florence_tasks(self, instance, batch_images, questions):
-        final_batch_results = [defaultdict(dict) for _ in range(len(batch_images))]
-        tasks_to_run = []
-        caption_style = self.config.get('florence_caption_style', 'Detailed')
-        caption_map = {"Normal": "<CAPTION>", "Detailed": "<DETAILED_CAPTION>", "More Detailed": "<MORE_DETAILED_CAPTION>"}
-        if caption_prompt := caption_map.get(caption_style):
-            tasks_to_run.append({'type': 'caption', 'prompt': caption_prompt, 'display': f"{caption_style} Caption"})
-        standard_tasks = {
-            'florence_enable_od': ("<OD>", "Object Detection"),
-            'florence_enable_dense_caption': ("<DENSE_REGION_CAPTION>", "Dense Caption"),
-            'florence_enable_ocr': ("<OCR>", "OCR"),
-            'florence_enable_ocr_with_region': ("<OCR_WITH_REGION>", "OCR w/ Region"),
-            'florence_enable_region_proposal': ("<REGION_PROPOSAL>", "Region Proposal"),
-        }
-        for config_key, (prompt, display) in standard_tasks.items():
-            if self.config.get(config_key):
-                tasks_to_run.append({'type': 'standard', 'prompt': prompt, 'display': display})
-        vqa_enabled = self.config.get('models_vqa_enabled', {}).get('florence', False)
-        if vqa_enabled and self.config.get('florence_enable_vqa'):
-            tasks_to_run.append({'type': 'vqa', 'prompts': questions, 'display': "VQA"})
-        if self.config.get('florence_enable_caption_grounding'):
-            tasks_to_run.append({'type': 'grounding', 'display': "Caption Grounding"})
-        generated_captions = ["" for _ in range(len(batch_images))]
-        for task in tasks_to_run:
-            prompts_for_batch = []
-            if task['type'] == 'vqa':
-                prompts_for_batch = [f"<VQA>{q}" for q in questions]
-            elif task['type'] == 'grounding':
-                if not any(cap.strip() for cap in generated_captions):
-                    self.log.emit("[Florence-2] Skipping Caption Grounding as no captions were generated.")
-                    continue
-                prompts_for_batch = [f"<CAPTION_TO_PHRASE_GROUNDING>{cap}" for cap in generated_captions]
-            else:
-                prompts_for_batch = task.get('prompts', [task.get('prompt')] * len(batch_images))
-            if not any(p and p.strip() for p in prompts_for_batch): continue
-            task_results = instance.infer(batch_images, prompts=prompts_for_batch)
-            for i, result in enumerate(task_results):
-                if not isinstance(result, dict) or "error" in result:
-                    final_batch_results[i][f"{task['display']}_error"] = result or "Empty result"
-                    continue
-                output_value = list(result.values())[0] if len(result) == 1 else result
-                if task['type'] == 'caption':
-                    generated_captions[i] = output_value
-                    output_key = caption_style.lower().replace(" ", "_") + "_caption"
-                elif task['type'] == 'vqa': output_key = 'answer'
-                elif task['type'] == 'grounding': output_key = 'caption_grounding'
-                else: output_key = task['prompt'].strip("<>").lower()
-                final_batch_results[i][output_key] = output_value
-        return [dict(res) for res in final_batch_results]
-    
-    def _save_final_json(self, image_path, results_dict, question_used):
-        final_json = {
-            "image_path": image_path, "image_filename": os.path.basename(image_path),
-            "question_used_for_image": question_used or "N/A"
-        }
-        txt_path = os.path.splitext(image_path)[0] + ".txt"
-        try:
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                final_json["existing_caption"] = f.read().strip()
-        except FileNotFoundError:
-            final_json["existing_caption"] = "N/A"
-        final_json.update(results_dict)
-        out_dir = self.config.get('output_dir', 'output')
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, os.path.splitext(os.path.basename(image_path))[0] + ".json")
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(final_json, f, indent=4, ensure_ascii=False)
+        images = self._discover_images()
+        if not images:
+            self.finished.emit("No images found to process.")
+            return
+        self.run_sequential_batched(images)
 
     def _discover_images(self):
         formats = ('.jpg', '.jpeg', '.png', '.webp', '.avif')
         paths = []
-        for root, _, files in os.walk(self.config['image_dir']):
+        image_dir = self.config.get('image_dir')
+        if not image_dir or not os.path.isdir(image_dir):
+            return []
+        for root, _, files in os.walk(image_dir):
             for f in files:
                 if f.lower().endswith(formats):
                     paths.append(os.path.join(root, f))
-        return paths
+        return sorted(paths)
 
-    def _filter_images(self, paths):
-        if not self.config.get('resume_processing', True):
-            return paths
-        filtered_paths = []
-        out_dir = self.config.get('output_dir', 'output')
-        for path in paths:
-            json_filename = os.path.splitext(os.path.basename(path))[0] + '.json'
-            if not os.path.exists(os.path.join(out_dir, json_filename)):
-                filtered_paths.append(path)
-        return filtered_paths
+    def run_sequential_batched(self, images_to_process):
+        import time
+        start_time = time.time()
+        self.log.emit("--- Starting sequential batch processing ---")
+        total_images = len(images_to_process)
+        
+        enabled = self.config.get("models_enabled", {})
+        # SGLang Legacy / Qwen Legacy logic
+        if self.config.get("sglang_legacy_support", False) and enabled.get("smolvlm"):
+            self.log.emit("[Config] SGLang legacy ON; remapping to smolvlm keys.")
+            enabled["smolvlm"] = False
+        
+        for model_key, model_class in self.model_map.items():
+            if not self._is_running: break
+            json_key = self.json_key_map[model_key]
+            if not enabled.get(json_key): continue
+            
+            model_path = get_model_path(model_key, self.config)
+            
+            # --- MODEL-LEVEL PRE-FILTERING ---
+            # Determine if ANY images in the entire set need this specific model
+            # before we even attempt to load it. 
+            # This prevents the expensive Load/Unload cycle (and WSL shutdown) if not needed.
+            any_needed = False
+            resume = self.config.get("resume_processing", True)
+            if not resume:
+                any_needed = True
+            else:
+                out_dir = self.config.get("output_dir", "output")
+                for p in images_to_process:
+                    json_path = os.path.join(out_dir, os.path.basename(p) + ".json")
+                    if not os.path.exists(json_path):
+                        any_needed = True; break
+                    try:
+                        with open(json_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        target_key = json_key
+                        if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                            target_key = "smolvlm"
+                        if target_key not in data:
+                            any_needed = True; break
+                    except:
+                        any_needed = True; break
+            
+            if not any_needed:
+                self.log.emit(f"[{model_key}] Skipping model: All images already processed.")
+                continue
 
-    def _cleanup(self):
-        for model_key in list(self.models.keys()):
-            self.models[model_key].unload()
-            del self.models[model_key]
-        self.models.clear()
+            self.log.emit(f"[{model_key}] Loading from {model_path}...")
+            try:
+                model = model_class(model_key, model_path, self.config)
+                model.set_log_callback(self.log.emit)
+                model.load()
+            except Exception as e:
+                self.log.emit(f"[{model_key}] ERROR: {e}")
+                continue
+
+            batch_size = self.config.get("model_specific_batch_sizes", {}).get(json_key, 1)
+            for i in range(0, len(images_to_process), batch_size):
+                if not self._is_running: break
+                chunk = images_to_process[i:i+batch_size]
+                
+                # Resuming logic
+                if self.config.get("resume_processing", True):
+                    needed = []
+                    for p in chunk:
+                        out_dir = self.config.get("output_dir", "output")
+                        json_path = os.path.join(out_dir, os.path.basename(p) + ".json")
+                        if not os.path.exists(json_path):
+                            needed.append(p)
+                            continue
+                        try:
+                            with open(json_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            # Check if the specific model's output is missing or incomplete
+                            target_key = json_key
+                            if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                                target_key = "smolvlm"
+                            if target_key not in data:
+                                needed.append(p)
+                        except:
+                            needed.append(p)
+                    chunk = needed
+
+                if not chunk: continue
+
+                imgs = []
+                valid_paths = []
+                for p in chunk:
+                    try:
+                        imgs.append(Image.open(p))
+                        valid_paths.append(p)
+                    except: pass
+                
+                if not imgs: continue
+                
+                self.progress.emit(i, total_images, f"[{model_key}] Processing batch {i//batch_size + 1}...")
+                try:
+                    # Provide questions/prompts if model needs them
+                    batch_questions = [self.config.get("common_question", "Describe this image.")] * len(imgs)
+                    
+                    results = model.infer(imgs, questions=batch_questions, prompts=batch_questions)
+                    for j, res in enumerate(results):
+                        self._save_result_buffered(valid_paths[j], json_key, res)
+                    
+                    if len(self.write_buffer) >= self.flush_interval:
+                        self._flush_buffer()
+                except Exception as e:
+                    self.log.emit(f"[{model_key}] Batch Error: {e}")
+
+            self._flush_buffer() # Final flush
+            model.unload()
+            del model
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            
+            self.log.emit(f"Waiting 10s for {model_key} cleanup...")
+            time.sleep(10)
+
+        elapsed = (time.time() - start_time) / 3600.0 # hours
+        self.finished.emit(f"Processing Complete. Total Time: {elapsed:.2f} hours")
+
+    def _save_result_buffered(self, image_path, json_key, result):
+        if image_path not in self.write_buffer:
+            self.write_buffer[image_path] = []
+        self.write_buffer[image_path].append((json_key, result))
+
+    def _flush_buffer(self):
+        if not self.write_buffer:
+            return
+        
+        count = len(self.write_buffer)
+        self.log.emit(f"Flushing write buffer for {count} images to disk...")
+        
+        out_dir = self.config.get("output_dir", "output")
+        os.makedirs(out_dir, exist_ok=True)
+        
+        for image_path, updates in self.write_buffer.items():
+            json_path = os.path.join(out_dir, os.path.basename(image_path) + ".json")
+            
+            # Load existing
+            data = {}
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except: pass
+            
+            # Metadata update
+            data["image_path"] = image_path
+            data["image_filename"] = os.path.basename(image_path)
+            data["question_used_for_image"] = self.config.get("common_question", "N/A")
+
+            # Apply updates
+            for json_key, result in updates:
+                save_key = json_key
+                if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                    save_key = "smolvlm"
+                    if isinstance(result, dict) and "full_output" in result:
+                        # Remap to smolvlm schema if not already
+                        result = {"qa_pairs": [{"question": "Describe this image.", "answer": result["full_output"]}]}
+                elif json_key == "qwen" and self.config.get("qwen_legacy_support", False):
+                    save_key = "wd_tagger"
+                
+                data[save_key] = result
+
+            # Batch write
+            try:
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4)
+            except Exception as e:
+                self.log.emit(f"Disk Write Error: {e}")
+                
+        self.write_buffer.clear()
+        self.log.emit(f"Disk flush complete. Cleaning memory...")
+        
+        # Periodic memory cleanup
         gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+    def _save_result(self, image_path, json_key, result):
+        self._save_result_buffered(image_path, json_key, result)
+        self._flush_buffer()
+

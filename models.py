@@ -143,7 +143,7 @@ class BlipModel(BaseModelWrapper):
         self.is_compiled = False
 
     @torch.inference_mode()
-    def _infer_model_specific(self, images, questions):
+    def _infer_model_specific(self, images, questions=None, **kwargs):
         if not self.is_compiled:
             use_graphs = self.config.get('use_cuda_graphs', False)
             print("\n--- BLIP First Batch Analysis (One-Time Cost) ---")
@@ -384,7 +384,7 @@ class JoyCaptionModel(BaseModelWrapper):
         if Llama is None: raise ImportError("llama-cpp-python is not installed.")
         self.model = Llama(self.model_path, n_gpu_layers=self.config.get('llava_n_gpu_layers', 99), n_ctx=self.config.get('llava_n_ctx', 2048), verbose=False)
 
-    def _infer_model_specific(self, images, questions):
+    def _infer_model_specific(self, images, questions=None, **kwargs):
         batch_results = []
         for i, image in enumerate(images):
             results = {}; prompt = "Please describe this image in detail."; results['caption'] = self._generate_caption(image, prompt)
@@ -451,14 +451,20 @@ class GitModel(BaseModelWrapper):
                     self.attn_impl = "Xformers"
                     self._log("GIT: Successfully loaded with Xformers.")
                 except (ValueError, ImportError):
-                    self._log("GIT: Xformers not available. Falling back to Eager (default).")
-                    self.model = GitForCausalLM.from_pretrained(
-                        self.model_path,
-                        torch_dtype=DTYPE,
-                        attn_implementation="eager"
-                    ).to(DEVICE).eval()
-                    self.attn_impl = "Eager (Default)"
-                    self._log("GIT: Successfully loaded with Eager.")
+                    self._log("GIT: Xformers not available. Trying SageAttention...")
+                    try:
+                        self.model = GitForCausalLM.from_pretrained(
+                            self.model_path, torch_dtype=DTYPE, attn_implementation="sage_attn"
+                        ).to(DEVICE).eval()
+                        self.attn_impl = "SageAttention"
+                        self._log("GIT: Successfully loaded with SageAttention.")
+                    except:
+                        self._log("GIT: SageAttention failed. Falling back to Eager.")
+                        self.model = GitForCausalLM.from_pretrained(
+                            self.model_path, torch_dtype=DTYPE, attn_implementation="eager"
+                        ).to(DEVICE).eval()
+                        self.attn_impl = "Eager (Default)"
+                        self._log("GIT: Successfully loaded with Eager.")
 
     def unload(self):
         super().unload()
@@ -490,7 +496,7 @@ class GitModel(BaseModelWrapper):
         print("--------------------------------------------------\n")
 
     @torch.inference_mode()
-    def _infer_model_specific(self, images, questions=None):
+    def _infer_model_specific(self, images, questions=None, **kwargs):
         if not self.is_compiled:
             self.compile_model()
 
