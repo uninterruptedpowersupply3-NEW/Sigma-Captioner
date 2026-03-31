@@ -1102,12 +1102,28 @@ class MainWindow(QMainWindow):
         form_layout.addWidget(btn2, 2, 2)
         
         layout.addWidget(QLabel("URL, Concurrency, Context, Max Tokens, Max Res imported from Settings->SGLang."))
-        layout.addWidget(QLabel("(SGLang Pipeline start button removed to enforce unified batch start sequence.)"))
+        
+        self.sglang_std_start_btn = QPushButton("▶ START SGLANG BATCH")
+        self.sglang_std_start_btn.clicked.connect(self._run_sglang_standalone)
+        layout.addWidget(self.sglang_std_start_btn)
         
         self.sglang_log = QPlainTextEdit()
         self.sglang_log.setReadOnly(True)
         self.sglang_log.setFont(QFont("Consolas", 9))
         layout.addWidget(self.sglang_log)
+
+    def _run_sglang_standalone(self):
+        input_dir = self.sglang_std_input.text()
+        out_file = self.sglang_std_output.text()
+        if not input_dir or not out_file:
+            QMessageBox.warning(self, "Error", "Input directory and Output File must be set.")
+            return
+        self.sglang_std_start_btn.setDisabled(True)
+        self._update_all_configs() # flush UI to config
+        self.sglang_worker = SGLangStandaloneWorker(self.config, input_dir, out_file, self.sglang_std_ext.text())
+        self.sglang_worker.log.connect(self.sglang_log.appendPlainText)
+        self.sglang_worker.finished.connect(lambda: self.sglang_std_start_btn.setEnabled(True))
+        self.sglang_worker.start()
 
     def _update_all_configs(self):
         self.config['qwen_use_json_cache'] = self.qwen_use_json_cache_checkbox.isChecked()

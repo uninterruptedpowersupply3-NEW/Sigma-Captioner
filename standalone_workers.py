@@ -493,67 +493,148 @@ class SGLangStandaloneWorker(QThread):
                 return set()
         return processed
 
-    def _process_single_image(self, image_path: Path) -> str:
+    def _worker_loop(self, job_queue):
         import requests
+        import json
+        import time as _time
         from PIL import Image
-
-        url = str(self.config.get("sglang_url", "http://127.0.0.1:30000/v1/chat/completions"))
+        import io
+        import base64
+        
+        sglang_url = str(self.config.get("sglang_url", "http://127.0.0.1:30000/generate"))
+        chat_url = sglang_url.replace("/generate", "/v1/chat/completions")
         system_context = str(self.config.get("sglang_system_context", "")).strip()
         max_tokens = int(self.config.get("sglang_max_tokens", 1024))
-        max_res = int(self.config.get("sglang_max_res", 256))
+        is_openai = "/v1" in sglang_url
+        format_regex = r"<reasoning>[\s\S]*?</reasoning>\s*<answer>[\s\S]*?</answer>"
+        
+        while True:
+            p = job_queue.get()
+            if p is None:
+                job_queue.task_done()
+                break
+            
+            generated_text = None
+            is_error = False
+            payload = None
+            
+            try:
+                with Image.open(p) as img:
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    # Force longest edge to be exactly 256 for rapid ingestion
+                    img.thumbnail((256, 256), Image.Resampling.LANCZOS)
+                    buffer = io.BytesIO()
+                    img.save(buffer, format="JPEG", quality=85)
+                    b64_img_uri = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
+                
+                if is_openai:
+                    payload = {
+                        "model": "default",
+                        "messages": [
+                            {"role": "system", "content": system_context},
+                            {"role": "user", "content": [
+                                {"type": "image_url", "image_url": {"url": b64_img_uri}},
+                                {"type": "text", "text": "<image>\nPlease analyze this image based on the system instructions."}
+                            ]}
+                        ],
+                        # Root-level regex bypasses strict Pydantic literal validation
+                        "regex": format_regex,
+                        "max_tokens": max_tokens,
+                        "temperature": 0.7,
+                        "top_p": 0.8,
+                        "presence_penalty": 1.5,
+                    }
+                else:
+                    # Native /generate API
+                    prompt = f"<|im_start|>system\n{system_context}<|im_end|>\n<|im_start|>user\n<image>\nPlease analyze this image based on the system instructions.<|im_end|>\n<|im_start|>assistant\n"
+                    payload = {
+                        "text": prompt,
+                        "image_data": [b64_img_uri],
+                        "sampling_params": {
+                            "temperature": 0.7,
+                            "max_new_tokens": max_tokens,
+                            "regex": format_regex
+                        }
+                    }
+            except Exception as e:
+                self.log.emit(f"Failed to prepare {p.name}: {e}")
+                is_error = True
+                generated_text = f"Preparation error: {e}"
+            
+            if payload is not None:
+                # Retry loop with exponential backoff
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        response = requests.post(chat_url if is_openai else sglang_url, json=payload, timeout=600)
+                        if response.status_code == 200:
+                            result = response.json()
+                            if is_openai:
+                                generated_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            else:
+                                generated_text = result.get("text", "") if isinstance(result, dict) else ""
+                                if not generated_text and isinstance(result, list) and len(result) > 0:
+                                    generated_text = result[0].get("text", "")
+                            
+                            if isinstance(generated_text, str) and generated_text.startswith("```json"):
+                                generated_text = generated_text.replace("```json\n", "", 1).replace("```", "")
+                            break  # Success
+                        elif response.status_code in (503, 429) and attempt < max_retries - 1:
+                            _time.sleep(2 ** attempt)
+                            continue
+                        else:
+                            generated_text = f"HTTP {response.status_code}: {response.text[:100]}"
+                            is_error = True
+                            break
+                    except requests.Timeout:
+                        if attempt < max_retries - 1:
+                            _time.sleep(2 ** attempt)
+                            continue
+                        generated_text = f"Connection timed out after {max_retries} retries (batch too large or server overloaded?)"
+                        is_error = True
+                    except (requests.ConnectionError, OSError) as conn_err:
+                        if attempt < max_retries - 1:
+                            _time.sleep(2 ** attempt)
+                            continue
+                        generated_text = f"Connection failed after {max_retries} retries: {conn_err}"
+                        is_error = True
+                    except Exception as e:
+                        generated_text = str(e)
+                        is_error = True
+                        break
 
-        with Image.open(image_path) as img:
-            w, h = img.size
-            if w > max_res or h > max_res:
-                img = img.copy()
-                img.thumbnail((max_res, max_res), Image.Resampling.LANCZOS)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
+            # Only save sidecar JSON for successful results
+            if not is_error and generated_text:
+                try:
+                    import re
+                    data = {
+                        "image_path": str(p.absolute()),
+                        "image_filename": p.name,
+                        "sglang": {
+                            "full_output": generated_text
+                        }
+                    }
+                    
+                    match_r = re.search(r"<reasoning>([\s\S]*?)</reasoning>", generated_text)
+                    match_a = re.search(r"<answer>([\s\S]*?)</answer>", generated_text)
+                    if match_r: data["sglang"]["reasoning"] = match_r.group(1).strip()
+                    if match_a: data["sglang"]["answer"] = match_a.group(1).strip()
 
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=85)
-            b64_img_uri = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    json_path = p.with_suffix(".json")
+                    with open(json_path, "w", encoding="utf-8") as jf:
+                        json.dump(data, jf, indent=4, ensure_ascii=False)
+                except Exception as e:
+                    self.log.emit(f"Warning: Failed to write sidecar json for {p.name}: {e}")
+            elif is_error:
+                self.log.emit(f"[SGLang] Skipped {p.name} (error, will retry next run): {generated_text[:80]}")
 
-        json_schema = {
-            "type": "object",
-            "properties": {
-                "thought_process": {"type": "string"},
-                "question": {"type": "string"},
-                "answer": {"type": "string"},
-            },
-            "required": ["thought_process", "question", "answer"],
-            "additionalProperties": False,
-        }
+            with self._progress_lock:
+                self.images_done += 1
+                if self.images_done % 5 == 0 or self.images_done == self.total_pending:
+                    self.log.emit(f"Progress: {self.images_done}/{self.total_pending}")
 
-        payload = {
-            "model": "default",
-            "messages": [
-                {"role": "system", "content": system_context},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": b64_img_uri}},
-                        {"type": "text", "text": "Please analyze this image based on the system instructions."},
-                    ],
-                },
-            ],
-            "response_format": {"type": "json_schema", "json_schema": {"name": "extraction_schema", "schema": json_schema}},
-            "max_tokens": max_tokens,
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "presence_penalty": 1.5,
-        }
-
-        chat_url = url.replace("/generate", "/v1/chat/completions")
-        response = requests.post(chat_url, json=payload, timeout=90)
-        if response.status_code != 200:
-            return json.dumps({"error": f"HTTP {response.status_code}: {response.text[:100]}"}, ensure_ascii=False)
-
-        result = response.json()
-        generated_text = result["choices"][0]["message"]["content"]
-        if isinstance(generated_text, str) and generated_text.startswith("```json"):
-            generated_text = generated_text.replace("```json\n", "", 1).replace("```", "")
-        return generated_text
+            job_queue.task_done()
 
     def run(self):
         try:
@@ -574,28 +655,74 @@ class SGLangStandaloneWorker(QThread):
                 self.log.emit("No new images to process.")
                 return
 
+            self.log.emit("Peeking image headers via imagesize for fast validation...")
+            try:
+                import imagesize
+            except ImportError:
+                imagesize = None
+
+            valid_paths = []
+            def peek_valid(p):
+                try:
+                    if imagesize is not None:
+                        w, h = imagesize.get(str(p))
+                        if w > 0 and h > 0:
+                            return p
+                    else:
+                        if p.stat().st_size > 0:
+                            return p
+                except Exception:
+                    pass
+                return None
+
+            import os
+            import concurrent.futures
+            workers = min(64, (os.cpu_count() or 4) * 4)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                for res in pool.map(peek_valid, pending_paths):
+                    if res:
+                        valid_paths.append(res)
+
+            if not valid_paths:
+                self.log.emit("No valid images found after peek.")
+                return
+
             concurrency = int(self.config.get("sglang_concurrency", 40))
-            max_workers = max(1, min(concurrency, len(pending_paths)))
-            self.log.emit(f"Processing {len(pending_paths)} images (concurrency={max_workers})...")
+            max_workers = max(1, min(concurrency, len(valid_paths)))
+            self.log.emit(f"Processing {len(valid_paths)} images (concurrency={max_workers}, Pre-fetch=2 batches ahead)...")
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(self._process_single_image, p): p for p in pending_paths}
-                done = 0
-                for future in concurrent.futures.as_completed(futures):
-                    p = futures[future]
-                    try:
-                        generated_text = future.result()
-                    except Exception as e:
-                        generated_text = json.dumps({"error": str(e)}, ensure_ascii=False)
+            import queue
+            import threading
+            from PIL import Image
+            import io
+            import base64
+            
+            # Universal safety for large images
+            Image.MAX_IMAGE_PIXELS = None
+            
+            job_queue = queue.Queue(maxsize=max_workers * 2)
+            self.images_done = 0
+            self.total_pending = len(valid_paths)
+            self._progress_lock = threading.Lock()
+            
+            consumers = []
+            for _ in range(max_workers):
+                t = threading.Thread(target=self._worker_loop, args=(job_queue,))
+                t.daemon = True
+                t.start()
+                consumers.append(t)
+            
+            for p in valid_paths:
+                # Put the path directly so the threads can encode it in parallel
+                job_queue.put(p)
+                
+            # Wait for all items to be processed
+            for _ in range(max_workers):
+                job_queue.put(None)
+                
+            for t in consumers:
+                t.join()
 
-                    with self._file_lock:
-                        with open(self.output_jsonl_path, "a", encoding="utf-8") as f:
-                            f.write(json.dumps({"file": p.name, "output": generated_text}, ensure_ascii=False) + "\n")
-                            f.flush()
-
-                    done += 1
-                    if done % 5 == 0 or done == len(pending_paths):
-                        self.log.emit(f"Progress: {done}/{len(pending_paths)}")
         except Exception as e:
             self.log.emit(f"ERROR (sglang standalone): {e}")
             self.log.emit(traceback.format_exc())
