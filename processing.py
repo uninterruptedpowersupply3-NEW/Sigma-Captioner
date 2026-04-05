@@ -311,6 +311,126 @@ class SGLangModel(BaseModelWrapper):
         final_answer_value = f"<reasoning> {thought} </reasoning> <answer> {result_answer} </answer>"
         return {"qa_pairs": [{"question": question, "answer": final_answer_value}]}
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # STANDALONE-STYLE FAST PATH — ported from sglang.py standalone
+    # Key wins: single session, all tasks at once, JPEG fast passthrough,
+    #           async per-worker I/O (no sequential image loading)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def infer_paths(self, paths):
+        """Standalone-style concurrent blast: paths in, parsed results out."""
+        async def _run_all():
+            connector = aiohttp.TCPConnector(
+                limit=self.concurrency + 20, force_close=False
+            )
+            timeout_cfg = aiohttp.ClientTimeout(total=300)
+            sem = asyncio.Semaphore(self.concurrency)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg) as session:
+                tasks = [self._process_path(session, sem, p) for p in paths]
+                return await asyncio.gather(*tasks)
+
+        return asyncio.run(_run_all())
+
+    async def _process_path(self, session, sem, path):
+        """Single async worker: read -> encode -> POST -> parse."""
+        async with sem:
+            try:
+                b64_uri = await self._fast_read_image(path)
+                if b64_uri is None:
+                    return {"error": "Failed to read image"}
+
+                target_url = self.url
+                if "/generate" in target_url:
+                    target_url = target_url.replace("/generate", "/v1/chat/completions")
+                elif not target_url.endswith("/v1/chat/completions"):
+                    target_url = target_url.rstrip("/") + "/v1/chat/completions"
+
+                payload = {
+                    "model": "default",
+                    "messages": [
+                        {"role": "system", "content": self.system_context},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": b64_uri}},
+                            {"type": "text", "text": "Analyze this image based on your character instructions."}
+                        ]}
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "qwen_extraction_schema",
+                            "strict": True,
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "thought_process": {"type": "string", "description": "Think step-by-step here. Keep it brief."},
+                                    "question": {"type": "string", "description": "Concise, highly technical question about the image."},
+                                    "answer": {"type": "string", "description": "Long, detailed, and technically exhaustive answer."}
+                                },
+                                "required": ["thought_process", "question", "answer"],
+                                "additionalProperties": False
+                            }
+                        }
+                    },
+                    "max_tokens": self.max_tokens,
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "presence_penalty": 1.5
+                }
+
+                async with session.post(target_url, json=payload, timeout=90) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        generated_text = data["choices"][0]["message"]["content"]
+                        return self._parse_output(generated_text)
+                    return {"error": f"HTTP {resp.status}"}
+            except Exception as e:
+                return {"error": str(e)}
+
+    async def _fast_read_image(self, path):
+        """Standalone-optimized reader: JPEG fast passthrough, async thread offload."""
+        def _read():
+            try:
+                path_str = str(path)
+                if "::ZIP::" in path_str:
+                    import zipfile
+                    zip_path, internal_path = path_str.split("::ZIP::")
+                    with zipfile.ZipFile(zip_path, 'r') as z:
+                        with z.open(internal_path) as zf:
+                            img_data = zf.read()
+                    img = Image.open(io.BytesIO(img_data))
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    w, h = img.size
+                    if w > self.max_res or h > self.max_res:
+                        img.thumbnail((self.max_res, self.max_res), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode('utf-8')
+
+                # Metadata-only read (no pixel decode)
+                with Image.open(path_str) as img:
+                    w, h = img.size
+                    mode = img.mode
+                    fmt = img.format
+
+                # FAST PATH: small RGB JPEG -> raw byte passthrough, zero decode
+                if w <= self.max_res and h <= self.max_res and mode == 'RGB' and fmt == 'JPEG':
+                    with open(path_str, "rb") as f:
+                        return "data:image/jpeg;base64," + base64.b64encode(f.read()).decode('utf-8')
+
+                # SLOW PATH: resize or format conversion needed
+                with Image.open(path_str) as img:
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    if w > self.max_res or h > self.max_res:
+                        img.thumbnail((self.max_res, self.max_res), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode('utf-8')
+            except Exception:
+                return None
+        return await asyncio.to_thread(_read)
+
 class ProcessingWorker(QThread):
     finished = pyqtSignal(str)
     progress = pyqtSignal(int, int, str)
@@ -363,27 +483,40 @@ class ProcessingWorker(QThread):
             return
 
         import zipfile
-        try:
-            for root, _, files in os.walk(image_dir):
-                if not self._is_running: break
-                for f in files:
-                    ext = f.lower()
-                    if ext.endswith(formats):
-                        path = os.path.join(root, f)
-                        self.path_queue.put(path)
-                        self.total_images_discovered += 1
-                    elif ext.endswith('.zip'):
-                        zip_path = os.path.join(root, f)
+
+        def _scandir_recursive(directory):
+            """os.scandir recursive generator — pure directory index reads, no stat()."""
+            try:
+                with os.scandir(directory) as it:
+                    for entry in it:
+                        if not self._is_running:
+                            return
                         try:
-                            with zipfile.ZipFile(zip_path, 'r') as z:
-                                for z_info in z.infolist():
-                                    if not self._is_running: break
-                                    if not z_info.is_dir() and z_info.filename.lower().endswith(formats):
-                                        path = f"{zip_path}::ZIP::{z_info.filename}"
-                                        self.path_queue.put(path)
-                                        self.total_images_discovered += 1
-                        except Exception as e:
-                            self.log.emit(f"Failed to read zip {zip_path}: {e}")
+                            if entry.is_file(follow_symlinks=False):
+                                name_lower = entry.name.lower()
+                                if name_lower.endswith(formats):
+                                    self.path_queue.put(entry.path)
+                                    self.total_images_discovered += 1
+                                elif name_lower.endswith('.zip'):
+                                    try:
+                                        with zipfile.ZipFile(entry.path, 'r') as z:
+                                            for z_info in z.infolist():
+                                                if not self._is_running: break
+                                                if not z_info.is_dir() and z_info.filename.lower().endswith(formats):
+                                                    path = f"{entry.path}::ZIP::{z_info.filename}"
+                                                    self.path_queue.put(path)
+                                                    self.total_images_discovered += 1
+                                    except Exception as e:
+                                        self.log.emit(f"Failed to read zip {entry.path}: {e}")
+                            elif entry.is_dir(follow_symlinks=False):
+                                _scandir_recursive(entry.path)
+                        except OSError:
+                            pass
+            except PermissionError:
+                pass
+
+        try:
+            _scandir_recursive(image_dir)
         except Exception as e:
             self.log.emit(f"Discovery Firehose Error: {e}")
         finally:
@@ -400,6 +533,7 @@ class ProcessingWorker(QThread):
         import time
         start_time = time.time()
         self.log.emit("--- Starting streaming sequential batch processing ---")
+        self.progress.emit(0, 0, "Initializing...")
         
         enabled = self.config.get("models_enabled", {})
         # SGLang Legacy / Qwen Legacy logic
@@ -413,21 +547,197 @@ class ProcessingWorker(QThread):
             if not self._is_running: break
             json_key = self.json_key_map[model_key]
             if not enabled.get(json_key): continue
-            
-            # START FIREHOSE FOR THIS MODEL
-            self.discovery_complete = False
-            self.total_images_discovered = 0
-            # Clear any leftover paths from previous model runs
-            while not self.path_queue.empty():
-                try: self.path_queue.get_nowait()
-                except: break
 
-            discovery_thread = threading.Thread(target=self._discovery_firehose, daemon=True)
-            discovery_thread.start()
+            # ═══════════════════════════════════════════════════════════
+            # SGLang DEDICATED FAST LOOP — matches standalone architecture
+            # No firehose queue, no batch windows, no per-file sidecar parse
+            # ═══════════════════════════════════════════════════════════
+            if model_key == "SGLang":
+                model_path = get_model_path(model_key, self.config)
+                self.log.emit(f"[{model_key}] Loading from {model_path}...")
+                try:
+                    model = model_class(model_key, model_path, self.config)
+                    model.set_log_callback(self.log.emit)
+                    model.load()
+                except Exception as e:
+                    self.log.emit(f"[{model_key}] ERROR: {e}")
+                    continue
 
+                # INSTANT SCAN — os.scandir recursive generator
+                # Pure directory-index reads, zero stat() calls, <1s even for 120k files
+                image_dir = self.config.get('image_dir')
+                formats = ('.jpg', '.jpeg', '.png', '.webp', '.avif')
+
+                def _scandir_images(directory):
+                    try:
+                        with os.scandir(directory) as it:
+                            for entry in it:
+                                if not self._is_running:
+                                    return
+                                try:
+                                    if entry.is_file(follow_symlinks=False):
+                                        if entry.name.lower().endswith(formats):
+                                            yield entry.path
+                                    elif entry.is_dir(follow_symlinks=False):
+                                        yield from _scandir_images(entry.path)
+                                except OSError:
+                                    pass
+                    except PermissionError:
+                        pass
+
+                all_paths = list(_scandir_images(image_dir))
+                self.log.emit(f"[{model_key}] Scanned {len(all_paths)} images.")
+
+                # BULK RESUME — set-based O(1) lookup, no per-file JSON parse
+                if self.config.get("resume_processing", True):
+                    check_key = json_key
+                    if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                        check_key = "smolvlm"
+                    done_set = set()
+                    for p in all_paths:
+                        sidecar = os.path.splitext(p)[0] + ".json"
+                        if os.path.exists(sidecar):
+                            try:
+                                with open(sidecar, 'r', encoding='utf-8') as jf:
+                                    sd = json.load(jf)
+                                val = sd.get(check_key)
+                                if val is not None and not (isinstance(val, dict) and "error" in val):
+                                    done_set.add(p)
+                            except Exception:
+                                pass
+                    pending = [p for p in all_paths if p not in done_set]
+                    self.log.emit(f"[{model_key}] {len(done_set)} already done, {len(pending)} pending.")
+                else:
+                    pending = all_paths
+
+                if pending:
+                    concurrency = self.config.get("sglang_concurrency", 40)
+                    flush_every = 500               # checkpoint every N completions
+                    total_pending = len(pending)
+                    completed = 0
+                    since_flush = 0
+
+                    self.log.emit(f"[{model_key}] as_completed blast, flush/{flush_every}. Starting {total_pending} images...")
+                    self.progress.emit(0, total_pending, f"[{model_key}] Starting...")
+
+                    # ONE session, ALL tasks submitted at once, semaphore caps concurrency.
+                    # as_completed() saves each result the moment it arrives — no straggler blocking.
+                    async def _run_as_completed():
+                        nonlocal completed, since_flush
+                        connector = aiohttp.TCPConnector(limit=concurrency + 20, force_close=False)
+                        timeout_cfg = aiohttp.ClientTimeout(total=300)
+                        sem = asyncio.Semaphore(concurrency)
+
+                        # Inline wrapper returns (path, result) so as_completed always knows the source path
+                        async def _worker(p):
+                            res = await model._process_path(session, sem, p)
+                            return p, res
+
+                        async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg) as session:
+                            tasks = [asyncio.ensure_future(_worker(p)) for p in pending]
+
+                            for coro in asyncio.as_completed(tasks):
+                                if not self._is_running:
+                                    break
+                                path, res = await coro
+                                self._save_result_buffered(path, json_key, res)
+                                completed += 1
+                                since_flush += 1
+                                if since_flush >= flush_every:
+                                    self._flush_buffer()
+                                    since_flush = 0
+                                    self.log.emit(f"[{model_key}] Checkpoint: {completed}/{total_pending} saved.")
+                                if completed % 20 == 0:
+                                    self.progress.emit(completed, total_pending, f"[{model_key}] {completed}/{total_pending}...")
+                            self._flush_buffer()  # final remainder
+
+                    try:
+                        asyncio.run(_run_as_completed())
+                    except Exception as e:
+                        self.log.emit(f"[{model_key}] Error: {e}")
+                    processed_count_global += completed
+                    self.progress.emit(total_pending, total_pending, f"[{model_key}] Done. {completed}/{total_pending} complete.")
+
+                model.unload()
+                del model
+                gc.collect()
+                if HAS_TORCH and torch.cuda.is_available(): torch.cuda.empty_cache()
+                self.log.emit(f"Waiting 10s for {model_key} cleanup...")
+                time.sleep(10)
+                continue
+
+            # ═══════════════════════════════════════════════════════════
+            # ALL OTHER MODELS — instant scan, O(1) batch dispatch
+            # Same architecture as SGLang: scandir → bulk resume → direct batch
+            # ═══════════════════════════════════════════════════════════
+            self.progress.emit(0, 0, f"[{model_key}] Scanning images...")
+
+            # INSTANT SCAN — os.scandir, same as the Firehose converter
+            image_dir = self.config.get('image_dir')
+            formats = ('.jpg', '.jpeg', '.png', '.webp', '.avif')
+            all_paths = []
+            scan_count = 0
+
+            def _scandir_all(directory):
+                nonlocal scan_count
+                try:
+                    with os.scandir(directory) as it:
+                        for entry in it:
+                            if not self._is_running:
+                                return
+                            try:
+                                if entry.is_file(follow_symlinks=False):
+                                    if entry.name.lower().endswith(formats):
+                                        all_paths.append(entry.path)
+                                        scan_count += 1
+                                        if scan_count % 10000 == 0:
+                                            self.progress.emit(0, 0, f"[{model_key}] Scanning... {scan_count:,} found")
+                                elif entry.is_dir(follow_symlinks=False):
+                                    _scandir_all(entry.path)
+                            except OSError:
+                                pass
+                except PermissionError:
+                    pass
+
+            _scandir_all(image_dir)
+            total_found = len(all_paths)
+            self.log.emit(f"[{model_key}] Scanned {total_found:,} images.")
+            self.progress.emit(0, total_found, f"[{model_key}] {total_found:,} found. Checking resume...")
+
+            # BULK RESUME — set-based O(1) lookup
+            if self.config.get("resume_processing", True):
+                check_key = json_key
+                if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                    check_key = "smolvlm"
+                elif json_key == "qwen" and self.config.get("qwen_legacy_support", False):
+                    check_key = "wd_tagger"
+                done_set = set()
+                for i, p in enumerate(all_paths):
+                    sidecar = os.path.splitext(p)[0] + ".json"
+                    if os.path.exists(sidecar):
+                        try:
+                            with open(sidecar, 'r', encoding='utf-8') as jf:
+                                sd = json.load(jf)
+                            val = sd.get(check_key)
+                            if val is not None and not (isinstance(val, dict) and "error" in val):
+                                done_set.add(p)
+                        except Exception:
+                            pass
+                    if (i + 1) % 10000 == 0:
+                        self.progress.emit(0, total_found, f"[{model_key}] Resume check: {i+1:,}/{total_found:,}...")
+                pending = [p for p in all_paths if p not in done_set]
+                self.log.emit(f"[{model_key}] {len(done_set):,} already done, {len(pending):,} pending.")
+            else:
+                pending = all_paths
+
+            if not pending:
+                self.log.emit(f"[{model_key}] Nothing to process, skipping.")
+                continue
+
+            # LOAD MODEL
             model_path = get_model_path(model_key, self.config)
-            
             self.log.emit(f"[{model_key}] Loading from {model_path}...")
+            self.progress.emit(0, len(pending), f"[{model_key}] Loading model...")
             try:
                 model = model_class(model_key, model_path, self.config)
                 model.set_log_callback(self.log.emit)
@@ -436,54 +746,20 @@ class ProcessingWorker(QThread):
                 self.log.emit(f"[{model_key}] ERROR: {e}")
                 continue
 
-            concurrency = self.config.get("sglang_concurrency", 40)
-            batch_size = 4 * concurrency if model_key == "SGLang" else self.config.get("model_specific_batch_sizes", {}).get(json_key, 1)
-            
-            self.log.emit(f"[{model_key}] Processing in firehose windows of size {batch_size}...")
+            batch_size = self.config.get("model_specific_batch_sizes", {}).get(json_key, 1)
+            total_pending = len(pending)
 
+            self.log.emit(f"[{model_key}] Processing {total_pending:,} images in batches of {batch_size}...")
+            self.progress.emit(0, total_pending, f"[{model_key}] 0/{total_pending:,}")
+
+            # DIRECT BATCH LOOP — no queue, no timeouts, O(1) per dispatch
             iteration = 0
-            while self._is_running:
-                chunk = []
-                while len(chunk) < batch_size and (not self.discovery_complete or not self.path_queue.empty()):
-                    try:
-                        chunk.append(self.path_queue.get(timeout=1))
-                    except queue.Empty:
-                        if self.discovery_complete: break
-                        continue
-                
-                if not chunk:
-                    if self.discovery_complete: break
-                    continue
+            for start in range(0, total_pending, batch_size):
+                if not self._is_running:
+                    break
+                chunk = pending[start:start + batch_size]
 
-                # Resuming logic
-                if self.config.get("resume_processing", True):
-                    def _is_done(p):
-                        json_sidecar = os.path.splitext(p)[0] + ".json"
-                        if not os.path.exists(json_sidecar):
-                            return False
-                        try:
-                            with open(json_sidecar, 'r', encoding='utf-8') as jf:
-                                sidecar_data = json.load(jf)
-                            check_key = json_key
-                            if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
-                                check_key = "smolvlm"
-                            elif json_key == "qwen" and self.config.get("qwen_legacy_support", False):
-                                check_key = "wd_tagger"
-                            model_result = sidecar_data.get(check_key)
-                            return model_result is not None and not (isinstance(model_result, dict) and "error" in model_result)
-                        except Exception:
-                            return False
-                    chunk = [p for p in chunk if not _is_done(p)]
-
-                if not chunk: continue
-                
-                iteration += len(chunk)
-                processed_count_global += len(chunk)
-                
-                # Update progress with what we know
-                current_total = max(iteration, self.total_images_discovered)
-                self.progress.emit(iteration, current_total, f"[{model_key}] Processing window...")
-
+                # Load images
                 imgs = []
                 valid_paths = []
                 for p in chunk:
@@ -497,7 +773,7 @@ class ProcessingWorker(QThread):
                             Image.MAX_IMAGE_PIXELS = None
                             img = Image.open(io.BytesIO(img_data))
                             w, h = img.size
-                            max_pixels = 4194304  # 4-Megapixel buffer (2048x2048 eq)
+                            max_pixels = 4194304
                             if w * h > max_pixels:
                                 scale = (max_pixels / (w * h)) ** 0.5
                                 img.thumbnail((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
@@ -506,34 +782,37 @@ class ProcessingWorker(QThread):
                         else:
                             Image.MAX_IMAGE_PIXELS = None
                             img = Image.open(p)
-                            # FAST SKIP: Don't do heavy sequential resizing here if SGLang (async/concurrent) handles it.
-                            if json_key != "sglang":
-                                w, h = img.size
-                                max_pixels = 4194304  # 4-Megapixel limit
-                                if w * h > max_pixels:
-                                    scale = (max_pixels / (w * h)) ** 0.5
-                                    img.thumbnail((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+                            w, h = img.size
+                            max_pixels = 4194304
+                            if w * h > max_pixels:
+                                scale = (max_pixels / (w * h)) ** 0.5
+                                img.thumbnail((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
                             imgs.append(img.copy())
                             valid_paths.append(p)
                     except Exception as e:
                         self.log.emit(f"Failed to read image {p}: {e}")
-                
-                if not imgs: continue
-                
+
+                if not imgs:
+                    continue
+
                 try:
-                    # Provide questions/prompts if model needs them
                     batch_questions = [self.config.get("common_question", "Describe this image.")] * len(imgs)
-                    
                     results = model.infer(imgs, questions=batch_questions, prompts=batch_questions)
                     for j, res in enumerate(results):
                         self._save_result_buffered(valid_paths[j], json_key, res)
-                    
                     if len(self.write_buffer) >= self.flush_interval:
                         self._flush_buffer()
                 except Exception as e:
-                    self.log.emit(f"[{model_key}] Window Error: {e}")
+                    self.log.emit(f"[{model_key}] Batch Error: {e}")
 
-            self._flush_buffer() # Final flush
+                iteration += len(chunk)
+                processed_count_global += len(chunk)
+                remaining = total_pending - iteration
+                self.progress.emit(iteration, total_pending, f"[{model_key}] {iteration:,}/{total_pending:,} done, {remaining:,} left")
+                if iteration % (batch_size * 10) == 0:
+                    self.log.emit(f"[{model_key}] Progress: {iteration:,}/{total_pending:,} ({iteration*100//total_pending}%)")
+
+            self._flush_buffer()  # Final flush
             model.unload()
             del model
             gc.collect()

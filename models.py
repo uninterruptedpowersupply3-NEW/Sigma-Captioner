@@ -24,6 +24,46 @@ except ImportError:
     Llama, tempfile = None, None
     print("llama-cpp-python library not available. JoyCaption model will be disabled.")
 
+import math
+import torch.nn.functional as F
+from transformers.models.blip.modeling_blip import BlipAttention
+
+# --- MONKEYPATCH BLIP FOR FLASH ATTENTION 2 ---
+def blip_flash_forward(self, hidden_states, head_mask=None, output_attentions=False):
+    """
+    Monkeypatch for BlipAttention to use PyTorch's SDPA, 
+    which automatically dispatches to Flash Attention 2 on CUDA+fp16/bf16.
+    """
+    bsz, tgt_len, _ = hidden_states.size()
+    
+    # Calculate Query, Key, Value
+    mixed_qkv = self.qkv(hidden_states)
+    mixed_qkv = mixed_qkv.reshape(bsz, tgt_len, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+    query_states, key_states, value_states = mixed_qkv[0], mixed_qkv[1], mixed_qkv[2]
+
+    # Force Flash Attention 2 via PyTorch SDPA Context Manager
+    with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=False):
+        attn_output = F.scaled_dot_product_attention(
+            query_states, 
+            key_states, 
+            value_states, 
+            attn_mask=None, 
+            dropout_p=self.dropout.p if self.training else 0.0, 
+            is_causal=False
+        )
+
+    # Reshape and project back to original dimensions
+    attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, tgt_len, self.embed_dim)
+    attn_output = self.projection(attn_output)
+
+    # FIX: Hugging Face's BlipEncoderLayer always expects a tuple of length 2 to unpack
+    return (attn_output, None)
+
+# Apply the patch
+BlipAttention.forward = blip_flash_forward
+# ----------------------------------------------
+
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -79,62 +119,20 @@ class BlipModel(BaseModelWrapper):
 
     def _load_model_specific(self):
         # Logic for the BLIP Captioning model
-        self._log("Loading BLIP captioning model...")
+        self._log("Loading BLIP captioning model (Monkeypatched for Flash Attention 2)...")
         self.processor_cap = BlipProcessor.from_pretrained(self.model_path_cap)
-        try:
-            self.model_cap = BlipForConditionalGeneration.from_pretrained(
-                self.model_path_cap, torch_dtype=DTYPE, attn_implementation="flash_attention_2"
-            ).to(DEVICE)
-            self.cap_attn_impl = "Flash Attention 2"
-        except (ValueError, ImportError):
-            self._log("Flash Attention 2 not available for captioner.")
-            try:
-                self.model_cap = BlipForConditionalGeneration.from_pretrained(
-                    self.model_path_cap, torch_dtype=DTYPE, attn_implementation="sdpa"
-                ).to(DEVICE)
-                self.cap_attn_impl = "SDPA"
-            except (ValueError, ImportError):
-                self._log("SDPA not available for captioner.")
-                try:
-                    self.model_cap = BlipForConditionalGeneration.from_pretrained(
-                        self.model_path_cap, torch_dtype=DTYPE, attn_implementation="xformers"
-                    ).to(DEVICE)
-                    self.cap_attn_impl = "Xformers"
-                except (ValueError, ImportError):
-                    self._log("Xformers not available for captioner, falling back to Eager.")
-                    self.model_cap = BlipForConditionalGeneration.from_pretrained(
-                        self.model_path_cap, torch_dtype=DTYPE, attn_implementation="eager"
-                    ).to(DEVICE)
-                    self.cap_attn_impl = "Eager (Default)"
+        self.model_cap = BlipForConditionalGeneration.from_pretrained(
+            self.model_path_cap, torch_dtype=DTYPE
+        ).to(DEVICE)
+        self.cap_attn_impl = "Flash Attention 2 (Patched)"
         
         # Logic for the BLIP VQA model
-        self._log("Loading BLIP VQA model...")
+        self._log("Loading BLIP VQA model (Monkeypatched for Flash Attention 2)...")
         self.processor_vqa = BlipProcessor.from_pretrained(self.model_path_vqa)
-        try:
-            self.model_vqa = BlipForQuestionAnswering.from_pretrained(
-                self.model_path_vqa, torch_dtype=DTYPE, attn_implementation="flash_attention_2"
-            ).to(DEVICE)
-            self.vqa_attn_impl = "Flash Attention 2"
-        except (ValueError, ImportError):
-            self._log("Flash Attention 2 not available for VQA.")
-            try:
-                self.model_vqa = BlipForQuestionAnswering.from_pretrained(
-                    self.model_path_vqa, torch_dtype=DTYPE, attn_implementation="sdpa"
-                ).to(DEVICE)
-                self.vqa_attn_impl = "SDPA"
-            except (ValueError, ImportError):
-                self._log("SDPA not available for VQA.")
-                try:
-                    self.model_vqa = BlipForQuestionAnswering.from_pretrained(
-                        self.model_path_vqa, torch_dtype=DTYPE, attn_implementation="xformers"
-                    ).to(DEVICE)
-                    self.vqa_attn_impl = "Xformers"
-                except (ValueError, ImportError):
-                    self._log("Xformers not available for VQA, falling back to Eager.")
-                    self.model_vqa = BlipForQuestionAnswering.from_pretrained(
-                        self.model_path_vqa, torch_dtype=DTYPE, attn_implementation="eager"
-                    ).to(DEVICE)
-                    self.vqa_attn_impl = "Eager (Default)"
+        self.model_vqa = BlipForQuestionAnswering.from_pretrained(
+            self.model_path_vqa, torch_dtype=DTYPE
+        ).to(DEVICE)
+        self.vqa_attn_impl = "Flash Attention 2 (Patched)"
 
     def unload(self):
         super().unload()
