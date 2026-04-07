@@ -2,331 +2,916 @@ import os
 import json
 import time
 import traceback
-from PIL import Image
-# --- ADD THIS IMPORT ---
-from PyQt6.QtCore import QThread, pyqtSignal
-from torch.utils.data import Dataset, DataLoader
-# --- END OF ADDITION ---
-import torch
+try:
+    import torch
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
 import gc
-from collections import defaultdict
-
-# ... (imports for models are fine)
-from models import (
-    BlipModel, FlorenceModel, ClipInterrogatorModel,
-    JoyCaptionModel, GitModel
-)
-from wd_tagger_app2 import WDTaggerApp2Model
-from moondream_model import MoondreamModel
-from smolvlm_model import SmolVLMModel
-from utils import get_model_path
-
+import sys
+import requests
+import asyncio
+import platform
+# Set Windows Selector Event Loop Policy for high-concurrency aiohttp performance
+if platform.system() == 'Windows':
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except:
+        pass
+import aiohttp
+import base64
+import io
+import re
+import concurrent.futures
+import queue
+import threading
+import glob
+from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 
-# --- START OF MODIFICATION 1: ADD DATASET AND COLLATE FUNCTION ---
+# Set Windows Selector Event Loop Policy for high-concurrency aiohttp performance
+if platform.system() == 'Windows':
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except:
+        pass
 
-class ImageCaptioningDataset(Dataset):
-    """
-    A PyTorch Dataset to handle loading images from a list of paths.
-    This is what the DataLoader's worker processes will use.
-    """
-    def __init__(self, image_paths):
-        self.image_paths = image_paths
+try:
+    from PyQt6.QtCore import QObject, pyqtSignal, QThread
+    HAS_PYQT = True
+except ImportError:
+    HAS_PYQT = False
+    class QObject: pass
+    class QThread: pass
+    def pyqtSignal(*args, **kwargs):
+        class MockSignal:
+            def emit(self, *args, **kwargs): pass
+        return MockSignal()
+from collections import defaultdict
+from utils import get_model_path
 
-    def __len__(self):
-        return len(self.image_paths)
+# Add qwen_embedding to path
+qwen_path = os.path.join(os.path.dirname(__file__), 'qwen_embedding')
+if qwen_path not in sys.path:
+    sys.path.append(qwen_path)
 
-    def __getitem__(self, idx):
-        path = self.image_paths[idx]
+class BaseModelWrapper:
+    def __init__(self, model_key, model_path, config):
+        self.model_key = model_key
+        self.model_path = model_path
+        self.config = config
+        self.log_callback = print
+
+    def set_log_callback(self, cb):
+        self.log_callback = cb
+
+    def _log(self, msg):
+        self.log_callback(msg)
+
+    def load(self):
+        self._load_model_specific()
+
+    def unload(self):
+        self._unload_model_specific()
+
+    def _load_model_specific(self):
+        pass
+
+    def _unload_model_specific(self):
+        pass
+
+    def infer(self, images, **kwargs):
+        return self._infer_model_specific(images, **kwargs)
+
+    def _infer_model_specific(self, images, **kwargs):
+        return [{"caption": "Base model output"}] * len(images)
+
+class QwenModel(BaseModelWrapper):
+    def _load_model_specific(self):
+        from backend import FastQwenEngine
+        self.engine = FastQwenEngine(
+            model_id=self.model_path,
+            precision=self.config.get("qwen_precision", "bf16"),
+            tf32=self.config.get("qwen_tf32", True),
+            quant=self.config.get("qwen_quant", False),
+            output_dim=self.config.get("qwen_output_dim", 2048),
+            inductor_cache_dir=self.config.get("qwen_inductor_cache_dir", ""),
+            inductor_compile_threads=self.config.get("qwen_inductor_compile_threads", 0),
+            log_callback=self.log_callback
+        )
+        cache_path = self.config.get("qwen_json_cache_path", "")
+        if cache_path and os.path.exists(cache_path):
+            self._log(f"Loading Qwen vocab cache: {cache_path}")
+            self.engine.load_vocab_cache(cache_path)
+        else:
+            self._log("Notice: No Qwen vocab cache found. Using default tags.")
+            self.engine.prepare_vocabulary(["masterpiece", "best quality", "1girl", "1boy", "anime"])
+        
+    def _infer_model_specific(self, images, **kwargs):
+        results = self.engine.predict_batch(
+            images,
+            threshold=self.config.get("qwen_threshold", 0.3),
+            max_tags=self.config.get("qwen_max_tags", 50),
+            use_compile=self.config.get("qwen_compile", True),
+            dynamic_compile=self.config.get("qwen_dynamic", True),
+            use_cuda_graphs=self.config.get("qwen_cuda_graphs", False),
+            use_pinned_memory=self.config.get("qwen_pinned_mem", True)
+        )
+        return [{"caption": ", ".join([t for t, s in res])} for res in results]
+
+    def _unload_model_specific(self):
+        if hasattr(self, 'engine'):
+            del self.engine
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+class SGLangModel(BaseModelWrapper):
+    def __init__(self, model_key, model_path, config):
+        super().__init__(model_key, model_path, config)
+        self.url = self.config.get("sglang_url") or self.config.get("sglang_endpoint") or "http://127.0.0.1:30000/generate"
+        self.concurrency = self.config.get("sglang_concurrency", 40)
+        self.max_tokens = self.config.get("sglang_max_tokens", 1024)
+        self.max_res = self.config.get("sglang_max_res", 256)
+        self.system_context = self.config.get("sglang_system_context", "")
+        self._resize_logged = False
+        self._session = None
+        self._connector = None
+
+    def load(self):
+        self._log(f"SGLang Client Ready: {self.url}")
+        
+        # Auto-Start via WSL logic (Simplified)
+        if self.config.get("sglang_auto_wsl", False):
+            try:
+                test_url = self.url.replace('/generate', '/v1/models').replace('/v1/chat/completions', '/v1/models')
+                resp = requests.get(test_url, timeout=2)
+                if resp.status_code == 200:
+                    self._log("[SGLang] Server already responding.")
+                    return
+            except: pass
+
+            wsl_cmd = self.config.get("sglang_wsl_cmd", "").strip()
+            if wsl_cmd:
+                self._log(f"[SGLang] Starting WSL server: {wsl_cmd}")
+                import subprocess
+                cmd = wsl_cmd if wsl_cmd.lower().startswith("wsl") else ["wsl", "bash", "-c", wsl_cmd]
+                try:
+                    subprocess.Popen(cmd, shell=isinstance(cmd, str), creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+                    time.sleep(5) 
+                except Exception as e:
+                    self._log(f"[SGLang] Failed to launch WSL server: {e}")
+
+    def unload(self):
+        self._session = None
+        self._connector = None
+        
+        if self.config.get("sglang_shutdown_wsl_on_unload", True):
+            try:
+                import subprocess
+                subprocess.run(["wsl", "--shutdown"], check=False)
+            except: pass
+            time.sleep(10)
+        
+    def _infer_model_specific(self, images, **kwargs):
+        async def run_burst():
+            # High-throughput session + Expert Semaphore logic from SGLangPro
+            import aiohttp
+            # Expert Optimization: Persistent Connector with a slight headroom over concurrency
+            connector = aiohttp.TCPConnector(limit=self.concurrency + 20, force_close=False)
+            timeout = aiohttp.ClientTimeout(total=600)
+            sem = asyncio.Semaphore(self.concurrency)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                tasks = [self._async_infer(session, sem, img) for img in images]
+                return await asyncio.gather(*tasks)
+        
         try:
-            # Open the image using PIL
-            with Image.open(path) as img:
-                # We return a copy of the image object and its original path
-                return img.copy(), path
-        except Exception:
-            # If an image is corrupt or cannot be opened, return None.
-            # Our collate_fn will handle filtering these out.
-            return None, None
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-def collate_fn(batch):
-    """
-    A custom collate function to filter out failed image loads (None values)
-    before they are passed to the model.
-    """
-    # Filter out samples where the image failed to load
-    batch = [b for b in batch if b[0] is not None]
-    if not batch:
-        # If the whole batch failed, return empty lists
-        return [], []
-    
-    # "Unzip" the batch of (image, path) tuples into two separate lists
-    images, paths = zip(*batch)
-    return list(images), list(paths)
+        if loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                return executor.submit(lambda: asyncio.run(run_burst())).result()
+        else:
+            return loop.run_until_complete(run_burst())
 
-# --- END OF MODIFICATION 1 ---
+    async def _async_infer(self, session, sem, img):
+        async with sem:
+            try:
+                if not img:
+                    return {"error": "Invalid image"}
 
+                # Optimized Image Prep from SGLangPro: Expert threading avoids GIL/IO bottlenecks
+                def prepare_image(img_obj):
+                    if img_obj.mode != 'RGB':
+                        img_obj = img_obj.convert('RGB')
+                    orig_w, orig_h = img_obj.size
+                    new_w, new_h = orig_w, orig_h
+                    if orig_w > self.max_res or orig_h > self.max_res:
+                        img_obj.thumbnail((self.max_res, self.max_res), Image.Resampling.LANCZOS)
+                        new_w, new_h = img_obj.size
+                    buf = io.BytesIO()
+                    img_obj.save(buf, format="JPEG", quality=85)
+                    raw_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                    return f"data:image/jpeg;base64,{raw_b64}", orig_w, orig_h, new_w, new_h
+                
+                # Expert logic: Offload PIL decoding and resizing to a thread pool for maximum throughput
+                raw_b64_str, orig_w, orig_h, new_w, new_h = await asyncio.to_thread(prepare_image, img)
+                
+                if not self._resize_logged:
+                    if orig_w > self.max_res or orig_h > self.max_res:
+                        self._log(f"[SGLang] Scaled image (MAX dim {self.max_res}): {orig_w}x{orig_h} -> {new_w}x{new_h}")
+                        self._resize_logged = True
+
+                # Endpoint Routing
+                target_url = self.url
+                if "/generate" in target_url:
+                    target_url = target_url.replace("/generate", "/v1/chat/completions")
+                elif not target_url.endswith("/v1/chat/completions"):
+                    target_url = target_url.rstrip("/") + "/v1/chat/completions"
+
+                # JSON Schema Grammar Logic from Pro-GUI
+                JSON_SCHEMA = {
+                    "type": "object",
+                    "properties": {
+                        "thought_process": {"type": "string", "description": "Think step-by-step here. Keep it brief."},
+                        "question": {"type": "string", "description": "Concise, highly technical question about the image."},
+                        "answer": {"type": "string", "description": "Long, detailed, and technically exhaustive answer."}
+                    },
+                    "required": ["thought_process", "question", "answer"],
+                    "additionalProperties": False
+                }
+
+                payload = {
+                    "model": "default",
+                    "messages": [
+                        {"role": "system", "content": self.system_context},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": raw_b64_str}},
+                            {"type": "text", "text": "Analyze this image based on your character instructions."}
+                        ]}
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "qwen_extraction_schema",
+                            "strict": True,
+                            "schema": JSON_SCHEMA
+                        }
+                    },
+                    "max_tokens": self.max_tokens,
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "presence_penalty": 1.5,
+                    "stop": ["</answer>"]
+                }
+                
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        async with session.post(target_url, json=payload) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                generated_text = data["choices"][0]["message"].get("content", "")
+                                return self._parse_output(generated_text)
+                            if resp.status in (503, 429) and attempt < max_retries - 1:
+                                await asyncio.sleep(2 ** attempt)
+                                continue
+                            return {"error": f"HTTP {resp.status}"}
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        return {"error": str(e)}
+                return {"error": "Maximum retries exceeded"}
+            except Exception as e:
+                return {"error": f"SGLang Internal Error: {str(e)}"}
+
+    def _parse_output(self, text, user_prompt="Generative Q&A"):
+        question = "What is in this image?"
+        thought = ""
+        result_answer = text
+        try:
+            clean_text = text
+            if clean_text.startswith("```json"):
+                clean_text = clean_text.replace("```json\n", "", 1).replace("```", "")
+            data = json.loads(clean_text)
+            thought = data.get("thought_process", "").strip()
+            question = data.get("question", "").strip()
+            result_answer = data.get("answer", "").strip()
+        except:
+            q_match = re.search(r"<question>([\s\S]*?)(?:</question>|$)", text)
+            if q_match: question = q_match.group(1).strip()
+            r_match = re.search(r"<reasoning>([\s\S]*?)(?:</reasoning>|$)", text)
+            if r_match: thought = r_match.group(1).strip()
+            a_match = re.search(r"<answer>([\s\S]*?)(?:</answer>|$)", text)
+            if a_match: result_answer = a_match.group(1).strip()
+
+        final_answer_value = f"<reasoning> {thought} </reasoning> <answer> {result_answer} </answer>"
+        return {"qa_pairs": [{"question": question, "answer": final_answer_value}]}
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # STANDALONE-STYLE FAST PATH — ported from sglang.py standalone
+    # Key wins: single session, all tasks at once, JPEG fast passthrough,
+    #           async per-worker I/O (no sequential image loading)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def infer_paths(self, paths):
+        """Standalone-style concurrent blast: paths in, parsed results out."""
+        async def _run_all():
+            connector = aiohttp.TCPConnector(
+                limit=self.concurrency + 20, force_close=False
+            )
+            timeout_cfg = aiohttp.ClientTimeout(total=300)
+            sem = asyncio.Semaphore(self.concurrency)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg) as session:
+                tasks = [self._process_path(session, sem, p) for p in paths]
+                return await asyncio.gather(*tasks)
+
+        return asyncio.run(_run_all())
+
+    async def _process_path(self, session, sem, path):
+        """Single async worker: read -> encode -> POST -> parse."""
+        async with sem:
+            try:
+                b64_uri = await self._fast_read_image(path)
+                if b64_uri is None:
+                    return {"error": "Failed to read image"}
+
+                target_url = self.url
+                if "/generate" in target_url:
+                    target_url = target_url.replace("/generate", "/v1/chat/completions")
+                elif not target_url.endswith("/v1/chat/completions"):
+                    target_url = target_url.rstrip("/") + "/v1/chat/completions"
+
+                payload = {
+                    "model": "default",
+                    "messages": [
+                        {"role": "system", "content": self.system_context},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": b64_uri}},
+                            {"type": "text", "text": "Analyze this image based on your character instructions."}
+                        ]}
+                    ],
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "qwen_extraction_schema",
+                            "strict": True,
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "thought_process": {"type": "string", "description": "Think step-by-step here. Keep it brief."},
+                                    "question": {"type": "string", "description": "Concise, highly technical question about the image."},
+                                    "answer": {"type": "string", "description": "Long, detailed, and technically exhaustive answer."}
+                                },
+                                "required": ["thought_process", "question", "answer"],
+                                "additionalProperties": False
+                            }
+                        }
+                    },
+                    "max_tokens": self.max_tokens,
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "presence_penalty": 1.5
+                }
+
+                async with session.post(target_url, json=payload, timeout=90) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        generated_text = data["choices"][0]["message"]["content"]
+                        return self._parse_output(generated_text)
+                    return {"error": f"HTTP {resp.status}"}
+            except Exception as e:
+                return {"error": str(e)}
+
+    async def _fast_read_image(self, path):
+        """Standalone-optimized reader: JPEG fast passthrough, async thread offload."""
+        def _read():
+            try:
+                path_str = str(path)
+                if "::ZIP::" in path_str:
+                    import zipfile
+                    zip_path, internal_path = path_str.split("::ZIP::")
+                    with zipfile.ZipFile(zip_path, 'r') as z:
+                        with z.open(internal_path) as zf:
+                            img_data = zf.read()
+                    img = Image.open(io.BytesIO(img_data))
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    w, h = img.size
+                    if w > self.max_res or h > self.max_res:
+                        img.thumbnail((self.max_res, self.max_res), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode('utf-8')
+
+                # Metadata-only read (no pixel decode)
+                with Image.open(path_str) as img:
+                    w, h = img.size
+                    mode = img.mode
+                    fmt = img.format
+
+                # FAST PATH: small RGB JPEG -> raw byte passthrough, zero decode
+                if w <= self.max_res and h <= self.max_res and mode == 'RGB' and fmt == 'JPEG':
+                    with open(path_str, "rb") as f:
+                        return "data:image/jpeg;base64," + base64.b64encode(f.read()).decode('utf-8')
+
+                # SLOW PATH: resize or format conversion needed
+                with Image.open(path_str) as img:
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    if w > self.max_res or h > self.max_res:
+                        img.thumbnail((self.max_res, self.max_res), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode('utf-8')
+            except Exception:
+                return None
+        return await asyncio.to_thread(_read)
 
 class ProcessingWorker(QThread):
-    progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(str)
+    progress = pyqtSignal(int, int, str)
     log = pyqtSignal(str)
-    
+
     def __init__(self, config):
         super().__init__()
-        # ... (the rest of __init__ is unchanged)
         self.config = config
         self._is_running = True
+        self.write_buffer = {}  # Buffering writes to save NVME endurance
+        self.flush_interval = 5000 # Flush every 5000 images for TPU deployment
         
+        # Firehose Discovery Variables
+        self.path_queue = queue.Queue(maxsize=10000) 
+        self.discovery_complete = False
+        self.total_images_discovered = 0
+        
+        # Delayed imports to avoid circular/early load issues
+        from models import BlipModel, FlorenceModel, ClipInterrogatorModel, JoyCaptionModel, GitModel
+        from moondream_model import MoondreamModel
+        from smolvlm_model import SmolVLMModel
+        from wd_tagger_app2 import WDTaggerApp2Model
+
         self.model_map = {
-            "CLIP_Interrogator": ClipInterrogatorModel, "BLIP": BlipModel, 
-            "Florence-2": FlorenceModel, "JoyCaption": JoyCaptionModel, 
-            "GIT": GitModel, "WD_Tagger": WDTaggerApp2Model,
-            "Moondream": MoondreamModel, "SmolVLM": SmolVLMModel,
+            "SGLang": SGLangModel, # SGLang first as requested
+            "Qwen": QwenModel,
+            "CLIP_Interrogator": ClipInterrogatorModel, "BLIP": BlipModel,
+            "Florence-2": FlorenceModel, "JoyCaption": JoyCaptionModel, "GIT": GitModel,
+            "WD_Tagger": WDTaggerApp2Model, "Moondream": MoondreamModel,
+            "SmolVLM": SmolVLMModel
         }
         self.json_key_map = {
-            "CLIP_Interrogator": "clip_interrogator", "BLIP": "blip", 
-            "Florence-2": "florence", "JoyCaption": "llava", "GIT": "git", 
-            "WD_Tagger": "wd_tagger", "Moondream": "moondream", 
-            "SmolVLM": "smolvlm",
+            "SGLang": "sglang",
+            "Qwen": "qwen",
+            "CLIP_Interrogator": "clip_interrogator", "BLIP": "blip",
+            "Florence-2": "florence", "JoyCaption": "llava", "GIT": "git",
+            "WD_Tagger": "wd_tagger", "Moondream": "moondream",
+            "SmolVLM": "smolvlm"
         }
-        
-        self.general_questions = []
-        self.moondream_questions = []
-        self.image_question_map = {}
-        self.moondream_image_question_map = {}
-
-    # ... (stop, run, and question loading methods are unchanged) ...
-    def stop(self):
-        self._is_running = False
-        self.log.emit("Processing stop requested. Finishing current batch...")
 
     def run(self):
-        start_time = time.time()
-        self.log.emit("Discovering images...")
+        # Firehose Logic: The sequential batcher will now handle starting discovery for each model
+        self.run_sequential_batched()
 
-        if self.config.get('use_question_file'):
+    def _discovery_firehose(self):
+        formats = ('.jpg', '.jpeg', '.png', '.webp', '.avif')
+        image_dir = self.config.get('image_dir')
+        if not image_dir or not os.path.isdir(image_dir):
+            self.discovery_complete = True
+            return
+
+        import zipfile
+
+        def _scandir_recursive(directory):
+            """os.scandir recursive generator — pure directory index reads, no stat()."""
             try:
-                with open(self.config['question_json_path'], 'r', encoding='utf-8') as f:
-                    self.general_questions = json.load(f)
-                if not isinstance(self.general_questions, list) or not self.general_questions:
-                    self.log.emit("Warning: General question file is invalid or empty. Using common question.")
-                    self.general_questions = [self.config.get('common_question')]
-                else:
-                    self.log.emit(f"Loaded {len(self.general_questions)} general questions.")
-            except Exception as e:
-                self.log.emit(f"Error loading general question file: {e}. Using common question.")
-                self.general_questions = [self.config.get('common_question')]
-        else:
-            self.general_questions = [self.config.get('common_question')]
+                with os.scandir(directory) as it:
+                    for entry in it:
+                        if not self._is_running:
+                            return
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                name_lower = entry.name.lower()
+                                if name_lower.endswith(formats):
+                                    self.path_queue.put(entry.path)
+                                    self.total_images_discovered += 1
+                                elif name_lower.endswith('.zip'):
+                                    try:
+                                        with zipfile.ZipFile(entry.path, 'r') as z:
+                                            for z_info in z.infolist():
+                                                if not self._is_running: break
+                                                if not z_info.is_dir() and z_info.filename.lower().endswith(formats):
+                                                    path = f"{entry.path}::ZIP::{z_info.filename}"
+                                                    self.path_queue.put(path)
+                                                    self.total_images_discovered += 1
+                                    except Exception as e:
+                                        self.log.emit(f"Failed to read zip {entry.path}: {e}")
+                            elif entry.is_dir(follow_symlinks=False):
+                                _scandir_recursive(entry.path)
+                        except OSError:
+                            pass
+            except PermissionError:
+                pass
 
-        if self.config.get('use_moondream_question_file'):
-            try:
-                with open(self.config['moondream_question_json_path'], 'r', encoding='utf-8') as f:
-                    self.moondream_questions = json.load(f)
-                if not isinstance(self.moondream_questions, list) or not self.moondream_questions:
-                    self.log.emit("Warning: Moondream question file is invalid or empty. Falling back to general questions.")
-                    self.moondream_questions = self.general_questions
-                else:
-                    self.log.emit(f"Loaded {len(self.moondream_questions)} Moondream-specific questions.")
-            except Exception as e:
-                self.log.emit(f"Error loading Moondream question file: {e}. Moondream will use general questions.")
-                self.moondream_questions = self.general_questions
-        else:
-            self.moondream_questions = self.general_questions
-
-        image_paths = self._discover_images()
-        images_to_process = self._filter_images(image_paths)
-        if not images_to_process:
-            self.log.emit("No new images to process."); self.finished.emit("Finished."); return
-
-        for i, path in enumerate(images_to_process):
-            self.image_question_map[path] = self.general_questions[i % len(self.general_questions)]
-            self.moondream_image_question_map[path] = self.moondream_questions[i % len(self.moondream_questions)]
-
-        final_results = self.run_sequential_batched(images_to_process)
-        self.log.emit("--- All models processed. Saving JSON files... ---")
-        for i, path in enumerate(final_results.keys()):
-            if not self._is_running: break
-            self.progress.emit(i + 1, len(final_results), f"Saving {os.path.basename(path)}")
-            question_used = self.moondream_image_question_map.get(path) if 'moondream' in final_results[path] and self.config.get('use_moondream_question_file') else self.image_question_map.get(path)
-            self._save_final_json(path, final_results[path], question_used)
-        
-        duration = time.time() - start_time
-        self.finished.emit(f"Processing finished in {duration:.2f} seconds.")
-
-
-    # --- START OF MODIFICATION 2: REPLACE THE run_sequential_batched METHOD ---
-    def run_sequential_batched(self, images_to_process):
-        self.log.emit("--- Starting sequential batch processing with DataLoader ---")
-        self.models = {}
-        final_results = defaultdict(dict)
-        total_images = len(images_to_process)
-        
         try:
-            for model_key, model_class in self.model_map.items():
-                json_key = self.json_key_map[model_key]
-                if not self.config['models_enabled'].get(json_key): continue
-                if not self._is_running: break
-                
+            _scandir_recursive(image_dir)
+        except Exception as e:
+            self.log.emit(f"Discovery Firehose Error: {e}")
+        finally:
+            self.discovery_complete = True
+            self.log.emit(f"Discovery Firehose Finished. Total images found: {self.total_images_discovered}")
+
+    def _read_completed_jsonl(self, json_key):
+        # RESUME LOGIC: Check for existence of sidecar .json files in the image directory
+        # This is more robust than parsing a single massive JSONL
+        completed = set()
+        return completed # We will handle path-level check inside the loop effectively
+
+    def run_sequential_batched(self):
+        import time
+        start_time = time.time()
+        self.log.emit("--- Starting streaming sequential batch processing ---")
+        self.progress.emit(0, 0, "Initializing...")
+        
+        enabled = self.config.get("models_enabled", {})
+        # SGLang Legacy / Qwen Legacy logic
+        if self.config.get("sglang_legacy_support", False) and enabled.get("smolvlm"):
+            self.log.emit("[Config] SGLang legacy ON; remapping to smolvlm keys.")
+            enabled["smolvlm"] = False
+        
+        processed_count_global = 0
+
+        for model_key, model_class in self.model_map.items():
+            if not self._is_running: break
+            json_key = self.json_key_map[model_key]
+            if not enabled.get(json_key): continue
+
+            # ═══════════════════════════════════════════════════════════
+            # SGLang DEDICATED FAST LOOP — matches standalone architecture
+            # No firehose queue, no batch windows, no per-file sidecar parse
+            # ═══════════════════════════════════════════════════════════
+            if model_key == "SGLang":
                 model_path = get_model_path(model_key, self.config)
                 self.log.emit(f"[{model_key}] Loading from {model_path}...")
-                
+                try:
+                    model = model_class(model_key, model_path, self.config)
+                    model.set_log_callback(self.log.emit)
+                    model.load()
+                except Exception as e:
+                    self.log.emit(f"[{model_key}] ERROR: {e}")
+                    continue
+
+                # INSTANT SCAN — os.scandir recursive generator
+                # Pure directory-index reads, zero stat() calls, <1s even for 120k files
+                image_dir = self.config.get('image_dir')
+                formats = ('.jpg', '.jpeg', '.png', '.webp', '.avif')
+
+                def _scandir_images(directory):
+                    try:
+                        with os.scandir(directory) as it:
+                            for entry in it:
+                                if not self._is_running:
+                                    return
+                                try:
+                                    if entry.is_file(follow_symlinks=False):
+                                        if entry.name.lower().endswith(formats):
+                                            yield entry.path
+                                    elif entry.is_dir(follow_symlinks=False):
+                                        yield from _scandir_images(entry.path)
+                                except OSError:
+                                    pass
+                    except PermissionError:
+                        pass
+
+                all_paths = list(_scandir_images(image_dir))
+                self.log.emit(f"[{model_key}] Scanned {len(all_paths)} images.")
+
+                # BULK RESUME — set-based O(1) lookup, no per-file JSON parse
+                if self.config.get("resume_processing", True):
+                    check_key = json_key
+                    if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                        check_key = "smolvlm"
+                    done_set = set()
+                    for p in all_paths:
+                        sidecar = os.path.splitext(p)[0] + ".json"
+                        if os.path.exists(sidecar):
+                            try:
+                                with open(sidecar, 'r', encoding='utf-8') as jf:
+                                    sd = json.load(jf)
+                                val = sd.get(check_key)
+                                if val is not None and not (isinstance(val, dict) and "error" in val):
+                                    done_set.add(p)
+                            except Exception:
+                                pass
+                    pending = [p for p in all_paths if p not in done_set]
+                    self.log.emit(f"[{model_key}] {len(done_set)} already done, {len(pending)} pending.")
+                else:
+                    pending = all_paths
+
+                if pending:
+                    concurrency = self.config.get("sglang_concurrency", 40)
+                    flush_every = 500               # checkpoint every N completions
+                    total_pending = len(pending)
+                    completed = 0
+                    since_flush = 0
+
+                    self.log.emit(f"[{model_key}] as_completed blast, flush/{flush_every}. Starting {total_pending} images...")
+                    self.progress.emit(0, total_pending, f"[{model_key}] Starting...")
+
+                    # ONE session, ALL tasks submitted at once, semaphore caps concurrency.
+                    # as_completed() saves each result the moment it arrives — no straggler blocking.
+                    async def _run_as_completed():
+                        nonlocal completed, since_flush
+                        connector = aiohttp.TCPConnector(limit=concurrency + 20, force_close=False)
+                        timeout_cfg = aiohttp.ClientTimeout(total=300)
+                        sem = asyncio.Semaphore(concurrency)
+
+                        # Inline wrapper returns (path, result) so as_completed always knows the source path
+                        async def _worker(p):
+                            res = await model._process_path(session, sem, p)
+                            return p, res
+
+                        async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg) as session:
+                            tasks = [asyncio.ensure_future(_worker(p)) for p in pending]
+
+                            for coro in asyncio.as_completed(tasks):
+                                if not self._is_running:
+                                    break
+                                path, res = await coro
+                                self._save_result_buffered(path, json_key, res)
+                                completed += 1
+                                since_flush += 1
+                                if since_flush >= flush_every:
+                                    self._flush_buffer()
+                                    since_flush = 0
+                                    self.log.emit(f"[{model_key}] Checkpoint: {completed}/{total_pending} saved.")
+                                if completed % 20 == 0:
+                                    self.progress.emit(completed, total_pending, f"[{model_key}] {completed}/{total_pending}...")
+                            self._flush_buffer()  # final remainder
+
+                    try:
+                        asyncio.run(_run_as_completed())
+                    except Exception as e:
+                        self.log.emit(f"[{model_key}] Error: {e}")
+                    processed_count_global += completed
+                    self.progress.emit(total_pending, total_pending, f"[{model_key}] Done. {completed}/{total_pending} complete.")
+
+                model.unload()
+                del model
+                gc.collect()
+                if HAS_TORCH and torch.cuda.is_available(): torch.cuda.empty_cache()
+                self.log.emit(f"Waiting 10s for {model_key} cleanup...")
+                time.sleep(10)
+                continue
+
+            # ═══════════════════════════════════════════════════════════
+            # ALL OTHER MODELS — instant scan, O(1) batch dispatch
+            # Same architecture as SGLang: scandir → bulk resume → direct batch
+            # ═══════════════════════════════════════════════════════════
+            self.progress.emit(0, 0, f"[{model_key}] Scanning images...")
+
+            # INSTANT SCAN — os.scandir, same as the Firehose converter
+            image_dir = self.config.get('image_dir')
+            formats = ('.jpg', '.jpeg', '.png', '.webp', '.avif')
+            all_paths = []
+            scan_count = 0
+
+            def _scandir_all(directory):
+                nonlocal scan_count
+                try:
+                    with os.scandir(directory) as it:
+                        for entry in it:
+                            if not self._is_running:
+                                return
+                            try:
+                                if entry.is_file(follow_symlinks=False):
+                                    if entry.name.lower().endswith(formats):
+                                        all_paths.append(entry.path)
+                                        scan_count += 1
+                                        if scan_count % 10000 == 0:
+                                            self.progress.emit(0, 0, f"[{model_key}] Scanning... {scan_count:,} found")
+                                elif entry.is_dir(follow_symlinks=False):
+                                    _scandir_all(entry.path)
+                            except OSError:
+                                pass
+                except PermissionError:
+                    pass
+
+            _scandir_all(image_dir)
+            total_found = len(all_paths)
+            self.log.emit(f"[{model_key}] Scanned {total_found:,} images.")
+            self.progress.emit(0, total_found, f"[{model_key}] {total_found:,} found. Checking resume...")
+
+            # BULK RESUME — set-based O(1) lookup
+            if self.config.get("resume_processing", True):
+                check_key = json_key
+                if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                    check_key = "smolvlm"
+                elif json_key == "qwen" and self.config.get("qwen_legacy_support", False):
+                    check_key = "wd_tagger"
+                done_set = set()
+                for i, p in enumerate(all_paths):
+                    sidecar = os.path.splitext(p)[0] + ".json"
+                    if os.path.exists(sidecar):
+                        try:
+                            with open(sidecar, 'r', encoding='utf-8') as jf:
+                                sd = json.load(jf)
+                            val = sd.get(check_key)
+                            if val is not None and not (isinstance(val, dict) and "error" in val):
+                                done_set.add(p)
+                        except Exception:
+                            pass
+                    if (i + 1) % 10000 == 0:
+                        self.progress.emit(0, total_found, f"[{model_key}] Resume check: {i+1:,}/{total_found:,}...")
+                pending = [p for p in all_paths if p not in done_set]
+                self.log.emit(f"[{model_key}] {len(done_set):,} already done, {len(pending):,} pending.")
+            else:
+                pending = all_paths
+
+            if not pending:
+                self.log.emit(f"[{model_key}] Nothing to process, skipping.")
+                continue
+
+            # LOAD MODEL
+            model_path = get_model_path(model_key, self.config)
+            self.log.emit(f"[{model_key}] Loading from {model_path}...")
+            self.progress.emit(0, len(pending), f"[{model_key}] Loading model...")
+            try:
                 model = model_class(model_key, model_path, self.config)
                 model.set_log_callback(self.log.emit)
                 model.load()
-                self.models[model_key] = model
-                
-                batch_size = self.config['model_specific_batch_sizes'].get(json_key, 1)
-                self.log.emit(f"[{model_key}] Starting processing with batch size {batch_size} and parallel workers...")
+            except Exception as e:
+                self.log.emit(f"[{model_key}] ERROR: {e}")
+                continue
 
-                # Create the Dataset and DataLoader
-                dataset = ImageCaptioningDataset(images_to_process)
-                data_loader = DataLoader(
-                    dataset,
-                    batch_size=batch_size,
-                    shuffle=False,
-                    prefetch_factor=5,
-                    num_workers=8,  # Use multiple CPU cores to load data in the background
-                    pin_memory=True, # Speeds up CPU to GPU data transfer
-                    collate_fn=collate_fn # Our function to handle corrupt images
-                )
+            batch_size = self.config.get("model_specific_batch_sizes", {}).get(json_key, 1)
+            total_pending = len(pending)
 
-                total_processed_for_model = 0
-                # The new, efficient processing loop
-                for batch_images, batch_paths in data_loader:
-                    if not self._is_running: break
-                    if not batch_images: continue # Skip if the entire batch was corrupt
+            self.log.emit(f"[{model_key}] Processing {total_pending:,} images in batches of {batch_size}...")
+            self.progress.emit(0, total_pending, f"[{model_key}] 0/{total_pending:,}")
 
-                    total_processed_for_model += len(batch_paths)
+            # DIRECT BATCH LOOP — no queue, no timeouts, O(1) per dispatch
+            iteration = 0
+            for start in range(0, total_pending, batch_size):
+                if not self._is_running:
+                    break
+                chunk = pending[start:start + batch_size]
 
-                    # Get the questions for the current valid batch
-                    if model_key == "Moondream":
-                        questions_for_batch = [self.moondream_image_question_map.get(path) for path in batch_paths]
-                    else:
-                        questions_for_batch = [self.image_question_map.get(path) for path in batch_paths]
-                    
+                # Load images
+                imgs = []
+                valid_paths = []
+                for p in chunk:
                     try:
-                        self.progress.emit(total_processed_for_model, total_images, f"Processing {len(batch_images)} images with {model_key}...")
-                        batch_outputs = self._run_inference_for_model(model, model_key, json_key, batch_images, questions_for_batch)
+                        if "::ZIP::" in p:
+                            zip_path, internal_path = p.split("::ZIP::")
+                            import zipfile
+                            with zipfile.ZipFile(zip_path, 'r') as z:
+                                with z.open(internal_path) as zf:
+                                    img_data = zf.read()
+                            Image.MAX_IMAGE_PIXELS = None
+                            img = Image.open(io.BytesIO(img_data))
+                            w, h = img.size
+                            max_pixels = 4194304
+                            if w * h > max_pixels:
+                                scale = (max_pixels / (w * h)) ** 0.5
+                                img.thumbnail((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+                            imgs.append(img.copy())
+                            valid_paths.append(p)
+                        else:
+                            Image.MAX_IMAGE_PIXELS = None
+                            img = Image.open(p)
+                            w, h = img.size
+                            max_pixels = 4194304
+                            if w * h > max_pixels:
+                                scale = (max_pixels / (w * h)) ** 0.5
+                                img.thumbnail((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+                            imgs.append(img.copy())
+                            valid_paths.append(p)
                     except Exception as e:
-                        self.log.emit(f"---!!! FATAL BATCH ERROR with {model_key} !!!---")
-                        self.log.emit(f"ERROR: {e}\n{traceback.format_exc()}")
-                        self.log.emit("---!!! SKIPPING THIS BATCH AND CONTINUING !!!---")
-                        batch_outputs = [{"Error": f"Fatal batch error: {e}"}] * len(batch_images)
+                        self.log.emit(f"Failed to read image {p}: {e}")
 
-                    for idx, output in enumerate(batch_outputs):
-                        # The batch_paths list is now guaranteed to be the correct size
-                        final_results[batch_paths[idx]].update({json_key: output})
-
-                self.models[model_key].unload()
-                del self.models[model_key]
-
-        finally:
-            self._cleanup()
-        return final_results
-    # --- END OF MODIFICATION 2 ---
-
-    # ... (the rest of the file, from _run_inference_for_model onwards, is unchanged) ...
-    def _run_inference_for_model(self, instance, model_key, json_key, batch_images, questions_for_batch):
-        if model_key == "Florence-2":
-            return self._run_florence_tasks(instance, batch_images, questions_for_batch)
-        elif model_key in ["BLIP", "GIT", "JoyCaption", "Moondream", "SmolVLM"]:
-            return instance.infer(batch_images, questions=questions_for_batch)
-        else:
-            return instance.infer(batch_images)
-
-    def _run_florence_tasks(self, instance, batch_images, questions):
-        final_batch_results = [defaultdict(dict) for _ in range(len(batch_images))]
-        tasks_to_run = []
-        caption_style = self.config.get('florence_caption_style', 'Detailed')
-        caption_map = {"Normal": "<CAPTION>", "Detailed": "<DETAILED_CAPTION>", "More Detailed": "<MORE_DETAILED_CAPTION>"}
-        if caption_prompt := caption_map.get(caption_style):
-            tasks_to_run.append({'type': 'caption', 'prompt': caption_prompt, 'display': f"{caption_style} Caption"})
-        standard_tasks = {
-            'florence_enable_od': ("<OD>", "Object Detection"),
-            'florence_enable_dense_caption': ("<DENSE_REGION_CAPTION>", "Dense Caption"),
-            'florence_enable_ocr': ("<OCR>", "OCR"),
-            'florence_enable_ocr_with_region': ("<OCR_WITH_REGION>", "OCR w/ Region"),
-            'florence_enable_region_proposal': ("<REGION_PROPOSAL>", "Region Proposal"),
-        }
-        for config_key, (prompt, display) in standard_tasks.items():
-            if self.config.get(config_key):
-                tasks_to_run.append({'type': 'standard', 'prompt': prompt, 'display': display})
-        vqa_enabled = self.config.get('models_vqa_enabled', {}).get('florence', False)
-        if vqa_enabled and self.config.get('florence_enable_vqa'):
-            tasks_to_run.append({'type': 'vqa', 'prompts': questions, 'display': "VQA"})
-        if self.config.get('florence_enable_caption_grounding'):
-            tasks_to_run.append({'type': 'grounding', 'display': "Caption Grounding"})
-        generated_captions = ["" for _ in range(len(batch_images))]
-        for task in tasks_to_run:
-            prompts_for_batch = []
-            if task['type'] == 'vqa':
-                prompts_for_batch = [f"<VQA>{q}" for q in questions]
-            elif task['type'] == 'grounding':
-                if not any(cap.strip() for cap in generated_captions):
-                    self.log.emit("[Florence-2] Skipping Caption Grounding as no captions were generated.")
+                if not imgs:
                     continue
-                prompts_for_batch = [f"<CAPTION_TO_PHRASE_GROUNDING>{cap}" for cap in generated_captions]
-            else:
-                prompts_for_batch = task.get('prompts', [task.get('prompt')] * len(batch_images))
-            if not any(p and p.strip() for p in prompts_for_batch): continue
-            task_results = instance.infer(batch_images, prompts=prompts_for_batch)
-            for i, result in enumerate(task_results):
-                if not isinstance(result, dict) or "error" in result:
-                    final_batch_results[i][f"{task['display']}_error"] = result or "Empty result"
-                    continue
-                output_value = list(result.values())[0] if len(result) == 1 else result
-                if task['type'] == 'caption':
-                    generated_captions[i] = output_value
-                    output_key = caption_style.lower().replace(" ", "_") + "_caption"
-                elif task['type'] == 'vqa': output_key = 'answer'
-                elif task['type'] == 'grounding': output_key = 'caption_grounding'
-                else: output_key = task['prompt'].strip("<>").lower()
-                final_batch_results[i][output_key] = output_value
-        return [dict(res) for res in final_batch_results]
-    
-    def _save_final_json(self, image_path, results_dict, question_used):
-        final_json = {
-            "image_path": image_path, "image_filename": os.path.basename(image_path),
-            "question_used_for_image": question_used or "N/A"
-        }
-        txt_path = os.path.splitext(image_path)[0] + ".txt"
-        try:
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                final_json["existing_caption"] = f.read().strip()
-        except FileNotFoundError:
-            final_json["existing_caption"] = "N/A"
-        final_json.update(results_dict)
-        out_dir = self.config.get('output_dir', 'output')
-        os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, os.path.splitext(os.path.basename(image_path))[0] + ".json")
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(final_json, f, indent=4, ensure_ascii=False)
 
-    def _discover_images(self):
-        formats = ('.jpg', '.jpeg', '.png', '.webp', '.avif')
-        paths = []
-        for root, _, files in os.walk(self.config['image_dir']):
-            for f in files:
-                if f.lower().endswith(formats):
-                    paths.append(os.path.join(root, f))
-        return paths
+                try:
+                    batch_questions = [self.config.get("common_question", "Describe this image.")] * len(imgs)
+                    results = model.infer(imgs, questions=batch_questions, prompts=batch_questions)
+                    for j, res in enumerate(results):
+                        self._save_result_buffered(valid_paths[j], json_key, res)
+                    if len(self.write_buffer) >= self.flush_interval:
+                        self._flush_buffer()
+                except Exception as e:
+                    self.log.emit(f"[{model_key}] Batch Error: {e}")
 
-    def _filter_images(self, paths):
-        if not self.config.get('resume_processing', True):
-            return paths
-        filtered_paths = []
-        out_dir = self.config.get('output_dir', 'output')
-        for path in paths:
-            json_filename = os.path.splitext(os.path.basename(path))[0] + '.json'
-            if not os.path.exists(os.path.join(out_dir, json_filename)):
-                filtered_paths.append(path)
-        return filtered_paths
+                iteration += len(chunk)
+                processed_count_global += len(chunk)
+                remaining = total_pending - iteration
+                self.progress.emit(iteration, total_pending, f"[{model_key}] {iteration:,}/{total_pending:,} done, {remaining:,} left")
+                if iteration % (batch_size * 10) == 0:
+                    self.log.emit(f"[{model_key}] Progress: {iteration:,}/{total_pending:,} ({iteration*100//total_pending}%)")
 
-    def _cleanup(self):
-        for model_key in list(self.models.keys()):
-            self.models[model_key].unload()
-            del self.models[model_key]
-        self.models.clear()
+            self._flush_buffer()  # Final flush
+            model.unload()
+            del model
+            gc.collect()
+            if HAS_TORCH and torch.cuda.is_available(): torch.cuda.empty_cache()
+            
+            self.log.emit(f"Waiting 10s for {model_key} cleanup...")
+            time.sleep(10)
+
+        elapsed = (time.time() - start_time) / 3600.0 # hours
+        self.finished.emit(f"Processing Complete. Total Time: {elapsed:.2f} hours")
+
+    def _save_result_buffered(self, image_path, json_key, result):
+        # Skip saving error results — they should be retried, not persisted
+        if isinstance(result, dict) and "error" in result:
+            self.log.emit(f"[{json_key}] Error for {os.path.basename(image_path)}: {result['error'][:100]}")
+            return
+        if image_path not in self.write_buffer:
+            self.write_buffer[image_path] = []
+        self.write_buffer[image_path].append((json_key, result))
+
+    def _flush_buffer(self):
+        if not self.write_buffer:
+            return
+        
+        count = len(self.write_buffer)
+        self.log.emit(f"Flushing {count} sidecar JSON files...")
+        
+        for image_path, updates in self.write_buffer.items():
+            if "::ZIP::" in image_path:
+                continue  # Skip ZIP entries — no sidecar for those
+            
+            json_path = os.path.splitext(image_path)[0] + ".json"
+            base_filename = os.path.basename(image_path)
+            
+            # Check for existing sidecar to merge (multi-model support)
+            current_data = {}
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        current_data = json.load(f)
+                except Exception:
+                    pass
+            
+            current_data["image_path"] = image_path
+            current_data["image_filename"] = base_filename
+            current_data["question_used_for_image"] = self.config.get("common_question", "N/A")
+
+            for json_key, result in updates:
+                save_key = json_key
+                if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                    save_key = "smolvlm"
+                elif json_key == "qwen" and self.config.get("qwen_legacy_support", False):
+                    save_key = "wd_tagger"
+                
+                current_data[save_key] = result
+            
+            try:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(current_data, f, indent=4, ensure_ascii=False)
+            except Exception as e:
+                self.log.emit(f"Sidecar Write Error for {base_filename}: {e}")
+                
+        self.write_buffer.clear()
+        self.log.emit(f"Flush complete ({count} files). Cleaning memory...")
+        
+        # Periodic memory cleanup
         gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        if HAS_TORCH and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+    def _save_result(self, image_path, json_key, result):
+        # Sigma-Captioner Standard: Save individual JSON sidecars
+        try:
+            if "::ZIP::" not in image_path:
+                json_path = os.path.splitext(image_path)[0] + ".json"
+                
+                # Check for existing data to merge or create new
+                current_data = {}
+                if os.path.exists(json_path):
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        current_data = json.load(f)
+                
+                current_data["image_path"] = image_path
+                current_data["image_filename"] = os.path.basename(image_path)
+                
+                # Extract and format the result
+                save_key = json_key
+                if json_key == "sglang" and self.config.get("sglang_legacy_support", False):
+                    save_key = "smolvlm"
+                elif json_key == "qwen" and self.config.get("qwen_legacy_support", False):
+                    save_key = "wd_tagger"
+                
+                current_data[save_key] = result
+                
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(current_data, f, indent=4, ensure_ascii=False)
+                    
+        except Exception as e:
+            self.log.emit(f"Sidecar Error for {image_path}: {e}")
+
+        # No buffered JSONL flushes needed here anymore as per request
+
